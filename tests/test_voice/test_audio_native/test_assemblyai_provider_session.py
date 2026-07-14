@@ -1,14 +1,20 @@
-"""Tests for AssemblyAIVoiceAgentProvider.configure_session hardening.
+"""Tests for AssemblyAIVoiceAgentProvider.configure_session handshake.
 
-Covers: (a) a stalled connection times out per-frame and configure_session
-proceeds without raising, and (b) an early non-session frame received while
-awaiting session.updated is buffered and surfaced by the next
-receive_events_for_duration() call, instead of being silently dropped.
+The Voice Agent API does not emit session.ready unprompted: the client sends
+session.update, and the server replies with session.updated (config echoed)
+then session.ready (agent live). configure_session waits for session.ready,
+treating session.updated as intermediate.
+
+Covers: (a) a completed handshake returns and records session_id; (b) an early
+non-handshake frame is buffered (not dropped) and surfaced by the next
+receive_events_for_duration(); (c) a stalled connection with no response raises
+a clear error rather than hanging.
 """
 
 import asyncio
 import json
 
+import pytest
 from websockets.protocol import State
 
 from tau2.voice.audio_native.assemblyai.provider import (
@@ -31,7 +37,7 @@ class FakeWebSocket:
     async def recv(self):
         if not self._frames:
             # Simulate a stalled connection: nothing to hand back before the
-            # caller's own timeout should fire.
+            # caller's own per-frame timeout should fire.
             await asyncio.sleep(10)
         return self._frames.pop(0)
 
@@ -40,21 +46,22 @@ def _provider():
     return AssemblyAIVoiceAgentProvider(api_key="test-key")
 
 
-def test_configure_session_timeout_proceeds_without_raising(monkeypatch):
-    # Shrink the timeout so the test doesn't actually wait 5s.
-    monkeypatch.setattr(
-        "tau2.voice.audio_native.assemblyai.provider.SESSION_UPDATE_FRAME_TIMEOUT",
-        0.05,
-    )
+def test_configure_session_completes_on_session_ready():
     provider = _provider()
-    provider.ws = FakeWebSocket(frames=[])
+    updated = json.dumps({"type": "session.updated", "config": {"id": "sess_abc"}})
+    ready = json.dumps({"type": "session.ready", "session_id": "sess_abc"})
+    provider.ws = FakeWebSocket(frames=[updated, ready])
 
-    # Should NOT raise, just log a warning and return.
     asyncio.run(
         provider.configure_session(
             system_prompt="hi", tools=[], vad_config=AssemblyAIVADConfig()
         )
     )
+
+    # A session.update was sent, and session_id was captured from the handshake.
+    assert len(provider.ws.sent) == 1
+    assert json.loads(provider.ws.sent[0])["type"] == "session.update"
+    assert provider.session_id == "sess_abc"
     assert provider._buffered_events == []
 
 
@@ -63,8 +70,10 @@ def test_configure_session_buffers_early_frame_for_next_receive():
     early_frame = json.dumps(
         {"type": "transcript.agent", "text": "hello", "reply_id": "r-1"}
     )
-    updated_frame = json.dumps({"type": "session.updated", "session": {}})
-    provider.ws = FakeWebSocket(frames=[early_frame, updated_frame])
+    updated = json.dumps({"type": "session.updated", "config": {"id": "s1"}})
+    ready = json.dumps({"type": "session.ready", "session_id": "s1"})
+    # An early conversation frame arrives before the handshake completes.
+    provider.ws = FakeWebSocket(frames=[early_frame, updated, ready])
 
     asyncio.run(
         provider.configure_session(
@@ -72,18 +81,35 @@ def test_configure_session_buffers_early_frame_for_next_receive():
         )
     )
 
-    # The early transcript.agent frame was parsed and buffered rather than
-    # discarded, since session.updated hadn't arrived yet.
+    # The early transcript.agent frame was parsed and buffered, not dropped.
     assert len(provider._buffered_events) == 1
     assert provider._buffered_events[0].type == "transcript.agent"
 
-    # The next receive_events_for_duration() call should surface it first,
-    # then clear the buffer.
+    # The next receive_events_for_duration() surfaces it first, then clears.
     provider.ws = FakeWebSocket(frames=[])
     events = asyncio.run(provider.receive_events_for_duration(0.02))
     assert len(events) == 1
     assert events[0].type == "transcript.agent"
     assert provider._buffered_events == []
+
+
+def test_configure_session_raises_when_no_response(monkeypatch):
+    # Shrink the timeout so the test doesn't actually wait 5s.
+    monkeypatch.setattr(
+        "tau2.voice.audio_native.assemblyai.provider.SESSION_UPDATE_FRAME_TIMEOUT",
+        0.05,
+    )
+    provider = _provider()
+    provider.ws = FakeWebSocket(frames=[])  # server never responds
+
+    # No session.updated/ready arrives -> clear error, not a silent proceed
+    # (which previously surfaced as an empty asyncio.TimeoutError).
+    with pytest.raises(RuntimeError, match="did not initialize"):
+        asyncio.run(
+            provider.configure_session(
+                system_prompt="hi", tools=[], vad_config=AssemblyAIVADConfig()
+            )
+        )
 
 
 def test_receive_events_for_duration_returns_and_clears_preseeded_buffer():

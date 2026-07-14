@@ -87,7 +87,14 @@ class AssemblyAIVoiceAgentProvider:
 
     @websocket_retry
     async def connect(self) -> None:
-        """Open the WebSocket connection and wait for session.ready."""
+        """Open the WebSocket connection.
+
+        The Voice Agent API does NOT emit ``session.ready`` unprompted — the
+        client must send a ``session.update`` first (done in
+        ``configure_session``), and the server then replies with
+        ``session.updated`` followed by ``session.ready``. So connect only opens
+        the socket; the handshake completes in ``configure_session``.
+        """
         if self.is_connected:
             return
         headers = {
@@ -96,19 +103,6 @@ class AssemblyAIVoiceAgentProvider:
         }
         logger.info(f"AssemblyAI Voice Agent: Connecting to {self.BASE_URL}")
         self.ws = await websockets.connect(self.BASE_URL, additional_headers=headers)
-
-        # Wait for session.ready (may be preceded by other frames).
-        for _ in range(50):
-            data = json.loads(await self.ws.recv())
-            if data.get("type") == "session.ready":
-                self.session_id = data.get("session_id")
-                logger.info(
-                    f"AssemblyAI Voice Agent: session.ready (session_id={self.session_id})"
-                )
-                return
-            if data.get("type") == "session.error":
-                raise RuntimeError(f"Connection failed: {data}")
-        raise RuntimeError("Did not receive session.ready")
 
     async def disconnect(self) -> None:
         """Close the WebSocket connection, if open."""
@@ -168,7 +162,15 @@ class AssemblyAIVoiceAgentProvider:
         vad_config: AssemblyAIVADConfig,
         voice: Optional[str] = None,
     ) -> None:
-        """Send session.update and wait for session.updated, buffering any other frames."""
+        """Send session.update and complete the handshake by waiting for session.ready.
+
+        The server replies with ``session.updated`` (config echoed) and then
+        ``session.ready`` (agent live). We wait for ``session.ready`` — the
+        definitive "agent initialized" signal — treating ``session.updated`` as
+        an intermediate frame. Each recv is individually bounded so a stalled
+        connection can't hang forever. Non-handshake frames are buffered so they
+        aren't dropped; the next receive_events_for_duration() surfaces them.
+        """
         if not self.is_connected:
             raise RuntimeError("Not connected. Call connect() first.")
         payload = self._build_session_payload(
@@ -177,33 +179,45 @@ class AssemblyAIVoiceAgentProvider:
         logger.debug(f"AssemblyAI session config: {json.dumps(payload)}")
         await self.ws.send(json.dumps(payload))
 
-        # Wait for session.updated (or error). Each frame is individually bounded
-        # so a stalled/silent connection can't hang this call forever. Frames
-        # that belong to the conversation (not the handshake) are buffered so
-        # they aren't silently dropped; the next receive_events_for_duration()
-        # call will surface them.
+        saw_updated = False
         while True:
             try:
                 raw = await asyncio.wait_for(
                     self.ws.recv(), timeout=SESSION_UPDATE_FRAME_TIMEOUT
                 )
             except asyncio.TimeoutError:
-                logger.warning(
-                    f"AssemblyAI Voice Agent: no session.updated within "
-                    f"{SESSION_UPDATE_FRAME_TIMEOUT}s; proceeding — session may "
-                    "already be configured"
+                if saw_updated:
+                    logger.warning(
+                        "AssemblyAI Voice Agent: session.updated received but no "
+                        f"session.ready within {SESSION_UPDATE_FRAME_TIMEOUT}s; "
+                        "proceeding — session is configured"
+                    )
+                    return
+                raise RuntimeError(
+                    "No response to session.update within "
+                    f"{SESSION_UPDATE_FRAME_TIMEOUT}s (no session.updated/ready). "
+                    "The agent did not initialize."
                 )
-                return
             data = json.loads(raw)
             t = data.get("type")
-            if t == "session.updated":
-                logger.info("AssemblyAI Voice Agent: session configured")
+            if t == "session.ready":
+                self.session_id = data.get("session_id") or self.session_id
+                logger.info(
+                    f"AssemblyAI Voice Agent: session.ready "
+                    f"(session_id={self.session_id})"
+                )
                 return
+            if t == "session.updated":
+                saw_updated = True
+                cfg = data.get("config") or {}
+                self.session_id = cfg.get("id") or self.session_id
+                logger.info("AssemblyAI Voice Agent: session configured")
+                continue
             if t == "session.error":
                 raise RuntimeError(f"Session configuration failed: {data}")
             logger.debug(
                 f"AssemblyAI Voice Agent: buffering early frame (type={t}) "
-                "received while awaiting session.updated"
+                "received during handshake"
             )
             self._buffered_events.append(parse_assemblyai_event(data))
 

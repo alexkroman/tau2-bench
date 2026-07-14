@@ -33,15 +33,17 @@ async def main() -> int:
     try:
         print("1. Connecting...")
         await provider.connect()
-        assert provider.session_id, "no session_id after connect"
-        print(f"   session_id={provider.session_id}")
 
-        print("2. Configuring session...")
+        # session.ready is only emitted after we send session.update, so the
+        # handshake (and session_id) completes inside configure_session.
+        print("2. Configuring session (sends session.update, awaits ready)...")
         await provider.configure_session(
             system_prompt="You are a helpful assistant. Keep replies to one short sentence.",
             tools=[],
             vad_config=AssemblyAIVADConfig(),
         )
+        assert provider.session_id, "no session_id after handshake"
+        print(f"   session_id={provider.session_id}")
 
         print("3. Sending μ-law speech + 1s silence...")
         with open(AUDIO_PATH, "rb") as f:
