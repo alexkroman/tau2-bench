@@ -326,7 +326,7 @@ class DiscreteTimeAdapter(ABC):
 # ---------------------------------------------------------------------------
 
 # Providers where the model is determined by the endpoint, not a parameter
-_PROVIDERS_WITH_ENDPOINT_DETERMINED_MODEL = ("xai",)
+_PROVIDERS_WITH_ENDPOINT_DETERMINED_MODEL = ("xai", "assemblyai")
 
 
 def create_adapter(
@@ -451,6 +451,16 @@ def create_adapter(
             cascaded_config=config,
             send_audio_instant=send_audio_instant,
             audio_format=audio_format,
+        )
+    elif provider == "assemblyai":
+        from tau2.voice.audio_native.assemblyai.discrete_time_adapter import (
+            DiscreteTimeAssemblyAIAdapter,
+        )
+
+        adapter = DiscreteTimeAssemblyAIAdapter(
+            tick_duration_ms=tick_duration_ms,
+            send_audio_instant=send_audio_instant,
+            reasoning_effort=reasoning_effort,
         )
     else:
         raise ValueError(f"Unknown provider: {provider}")
