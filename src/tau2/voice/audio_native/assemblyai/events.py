@@ -3,8 +3,12 @@
 Reference: https://www.assemblyai.com/docs/voice-agents/voice-agent-api
 
 Field names for some events (reply.audio audio field, transcript delta text
-field) are modeled from the docs and verified against the live API in the
-standalone smoke test. Models ignore unknown fields so parsing never fails.
+field) are modeled from the docs only and remain UNVERIFIED against a live
+connection — no ASSEMBLYAI_API_KEY was available to run the standalone smoke
+test against the real API. Models tolerate field-name mismatches via Optional
+fields and extra="ignore", so parsing never fails outright, but a genuine
+mismatch will silently degrade to empty/default fields until this is run
+live with a real API key.
 """
 
 from typing import Any, Dict, Literal, Optional, Union

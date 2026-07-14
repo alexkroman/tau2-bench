@@ -12,6 +12,7 @@ from typing import Any, List, Optional
 from loguru import logger
 
 from tau2.config import (
+    DEFAULT_ASSEMBLYAI_VOICE,
     DEFAULT_AUDIO_NATIVE_CONNECT_TIMEOUT,
     DEFAULT_AUDIO_NATIVE_DISCONNECT_TIMEOUT,
     DEFAULT_AUDIO_NATIVE_TICK_TIMEOUT_BUFFER,
@@ -47,7 +48,7 @@ class DiscreteTimeAssemblyAIAdapter(DiscreteTimeAdapter):
         send_audio_instant: bool = True,
         reasoning_effort: Optional[str] = None,
         provider: Optional[AssemblyAIVoiceAgentProvider] = None,
-        voice: str = "ivy",
+        voice: str = DEFAULT_ASSEMBLYAI_VOICE,
     ):
         if reasoning_effort is not None:
             raise ValueError(
@@ -242,6 +243,18 @@ class DiscreteTimeAssemblyAIAdapter(DiscreteTimeAdapter):
         elif isinstance(event, AAIReplyDoneEvent):
             if event.status == "interrupted":
                 self._pending_tool_results.clear()
+                logger.debug(f"Reply done (status={event.status})")
+                return
+            reply_id = event.reply_id or self._current_item_id
+            ut = self._utterance_transcripts.get(reply_id) if reply_id else None
+            if ut is not None:
+                if ut.audio_bytes_received == 0:
+                    logger.warning(f"Reply {reply_id} completed with no audio")
+                if ut.transcript_received == "":
+                    logger.warning(
+                        f"Reply {reply_id} completed with no transcript — "
+                        "possible event schema mismatch"
+                    )
             logger.debug(f"Reply done (status={event.status})")
 
         elif isinstance(event, AAIUserTranscriptEvent):

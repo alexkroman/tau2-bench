@@ -81,6 +81,38 @@ def test_reply_done_interrupted_discards_pending_tools():
     assert a._pending_tool_results == []
 
 
+def test_agent_transcript_overwrites_not_appends():
+    a = _adapter()
+    r = _result()
+    a._process_event(r, AAIReplyStartedEvent(reply_id="r-1"))
+    a._process_event(r, AAIAgentTranscriptEvent(text="first text", reply_id="r-1"))
+    a._process_event(r, AAIAgentTranscriptEvent(text="second text", reply_id="r-1"))
+    # transcript.agent carries the full text each time (not deltas); the
+    # handler must overwrite, not concatenate.
+    assert a._utterance_transcripts["r-1"].transcript_received == "second text"
+
+
+def test_skip_item_id_discards_subsequent_audio():
+    a = _adapter()
+    r1 = _result()
+    a._process_event(r1, AAIReplyStartedEvent(reply_id="r-1"))
+    a._process_event(r1, AAISpeechStartedEvent())
+    assert r1.skip_item_id == "r-1"
+
+    # A fresh tick whose skip_item_id carries over the truncated item.
+    r2 = _result()
+    r2.skip_item_id = "r-1"
+    audio_bytes = b"\xab" * 24
+    a._process_event(
+        r2,
+        AAIReplyAudioEvent(
+            audio=base64.b64encode(audio_bytes).decode(), reply_id="r-1"
+        ),
+    )
+    assert r2.agent_audio_chunks == []
+    assert r2.truncated_audio_bytes == len(audio_bytes)
+
+
 class FakeAssemblyAIProvider:
     """Fake provider for testing tool result flushing."""
 

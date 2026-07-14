@@ -33,6 +33,10 @@ from tau2.voice.audio_native.assemblyai.events import (
 
 load_dotenv()
 
+# No existing tau2.config timeout fits a per-frame wait during session
+# configuration; kept local since it's specific to this provider's handshake.
+SESSION_UPDATE_FRAME_TIMEOUT = 5.0  # seconds
+
 
 class AssemblyAIAudioFormat(str, Enum):
     PCMU = "audio/pcmu"  # G.711 μ-law 8kHz (telephony, no conversion)
@@ -68,9 +72,13 @@ class AssemblyAIVoiceAgentProvider:
         self.audio_format = audio_format
         self.ws: Optional[websockets.WebSocketClientProtocol] = None
         self.session_id: Optional[str] = None
+        # Non-session frames seen while waiting for session.updated in
+        # configure_session(); surfaced by the next receive_events_for_duration().
+        self._buffered_events: List[AAIEvent] = []
 
     @property
     def is_connected(self) -> bool:
+        """Check whether the WebSocket connection is currently open."""
         if self.ws is None:
             return False
         from websockets.protocol import State
@@ -79,6 +87,7 @@ class AssemblyAIVoiceAgentProvider:
 
     @websocket_retry
     async def connect(self) -> None:
+        """Open the WebSocket connection and wait for session.ready."""
         if self.is_connected:
             return
         headers = {
@@ -102,6 +111,7 @@ class AssemblyAIVoiceAgentProvider:
         raise RuntimeError("Did not receive session.ready")
 
     async def disconnect(self) -> None:
+        """Close the WebSocket connection, if open."""
         if self.ws:
             logger.info("AssemblyAI Voice Agent: Disconnecting")
             await self.ws.close()
@@ -158,6 +168,7 @@ class AssemblyAIVoiceAgentProvider:
         vad_config: AssemblyAIVADConfig,
         voice: Optional[str] = None,
     ) -> None:
+        """Send session.update and wait for session.updated, buffering any other frames."""
         if not self.is_connected:
             raise RuntimeError("Not connected. Call connect() first.")
         payload = self._build_session_payload(
@@ -166,18 +177,38 @@ class AssemblyAIVoiceAgentProvider:
         logger.debug(f"AssemblyAI session config: {json.dumps(payload)}")
         await self.ws.send(json.dumps(payload))
 
-        # Wait for session.updated (or error). Bounded to avoid hanging.
-        for _ in range(50):
-            data = json.loads(await self.ws.recv())
+        # Wait for session.updated (or error). Each frame is individually bounded
+        # so a stalled/silent connection can't hang this call forever. Frames
+        # that belong to the conversation (not the handshake) are buffered so
+        # they aren't silently dropped; the next receive_events_for_duration()
+        # call will surface them.
+        while True:
+            try:
+                raw = await asyncio.wait_for(
+                    self.ws.recv(), timeout=SESSION_UPDATE_FRAME_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"AssemblyAI Voice Agent: no session.updated within "
+                    f"{SESSION_UPDATE_FRAME_TIMEOUT}s; proceeding — session may "
+                    "already be configured"
+                )
+                return
+            data = json.loads(raw)
             t = data.get("type")
             if t == "session.updated":
                 logger.info("AssemblyAI Voice Agent: session configured")
                 return
             if t == "session.error":
                 raise RuntimeError(f"Session configuration failed: {data}")
-        logger.warning("No session.updated received; continuing")
+            logger.debug(
+                f"AssemblyAI Voice Agent: buffering early frame (type={t}) "
+                "received while awaiting session.updated"
+            )
+            self._buffered_events.append(parse_assemblyai_event(data))
 
     async def send_audio(self, audio_data: bytes) -> None:
+        """Base64-encode and send a chunk of user audio to the API."""
         if not self.is_connected:
             raise RuntimeError("Not connected to API")
         audio_b64 = base64.b64encode(audio_data).decode("utf-8")
@@ -192,6 +223,7 @@ class AssemblyAIVoiceAgentProvider:
         )
 
     async def receive_events(self) -> AsyncGenerator[AAIEvent, None]:
+        """Yield parsed events from the WebSocket as they arrive (with periodic timeouts)."""
         if not self.is_connected:
             raise RuntimeError("Not connected to API")
         while self.is_connected:
@@ -215,7 +247,11 @@ class AssemblyAIVoiceAgentProvider:
     async def receive_events_for_duration(
         self, duration_seconds: float
     ) -> List[AAIEvent]:
+        """Collect events for a fixed duration, surfacing any buffered frames first."""
         events: List[AAIEvent] = []
+        if self._buffered_events:
+            events.extend(self._buffered_events)
+            self._buffered_events = []
         end_time = asyncio.get_event_loop().time() + duration_seconds
         async for event in self.receive_events():
             if not isinstance(event, AAITimeoutEvent):
