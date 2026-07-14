@@ -48,7 +48,10 @@ def test_tools_use_flat_format():
 
 
 def test_audio_format_default_is_pcmu():
-    assert AssemblyAIVoiceAgentProvider(api_key="k").audio_format == AssemblyAIAudioFormat.PCMU
+    assert (
+        AssemblyAIVoiceAgentProvider(api_key="k").audio_format
+        == AssemblyAIAudioFormat.PCMU
+    )
 
 
 def test_missing_api_key_raises(monkeypatch):

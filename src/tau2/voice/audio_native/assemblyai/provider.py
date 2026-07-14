@@ -26,7 +26,6 @@ from tau2.environment.tool import Tool
 from tau2.utils.retry import websocket_retry
 from tau2.voice.audio_native.assemblyai.events import (
     AAIEvent,
-    AAISessionErrorEvent,
     AAITimeoutEvent,
     AAIUnknownEvent,
     parse_assemblyai_event,
@@ -38,7 +37,7 @@ load_dotenv()
 class AssemblyAIAudioFormat(str, Enum):
     PCMU = "audio/pcmu"  # G.711 μ-law 8kHz (telephony, no conversion)
     PCMA = "audio/pcma"  # G.711 A-law 8kHz
-    PCM = "audio/pcm"    # PCM16 24kHz
+    PCM = "audio/pcm"  # PCM16 24kHz
 
 
 class AssemblyAIVADConfig(BaseModel):
