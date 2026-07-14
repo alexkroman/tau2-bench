@@ -169,6 +169,13 @@ DEFAULT_XAI_VOICE = "Ara"  # overridable: Ara, Rex, Sal, Eve, Leo
 DEFAULT_XAI_MODEL = "xai-realtime"  # fixed, determined by endpoint
 
 # =============================================================================
+# ASSEMBLYAI PROVIDER (overridable voice, fixed API constants)
+# =============================================================================
+DEFAULT_ASSEMBLYAI_VOICE_AGENT_URL = "wss://agents.assemblyai.com/v1/ws"  # fixed
+DEFAULT_ASSEMBLYAI_VOICE = "ivy"  # overridable
+DEFAULT_ASSEMBLYAI_MODEL = "managed"  # fixed, determined by endpoint
+
+# =============================================================================
 # NOVA PROVIDER (overridable model/voice, fixed API constants)
 # =============================================================================
 DEFAULT_NOVA_MODEL = "amazon.nova-2-sonic-v1:0"  # overridable
