@@ -11,6 +11,7 @@ Full-duplex voice evaluation via provider-specific realtime APIs. Each provider 
 | **xai** | Native audio | xAI Grok Voice Agent | xai-realtime |
 | **nova** | Native audio | Amazon Nova Sonic | amazon.nova-2-sonic-v1:0 |
 | **qwen** | Native audio | Alibaba Qwen Omni | qwen3-omni-flash-realtime |
+| **assemblyai** | Native audio | AssemblyAI Voice Agent API | managed (endpoint-determined) |
 | **livekit** | Cascaded (STT→LLM→TTS) | LiveKit + Deepgram + OpenAI | Configurable |
 
 ## Architecture
