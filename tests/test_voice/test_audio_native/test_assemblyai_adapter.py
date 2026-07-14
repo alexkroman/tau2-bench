@@ -1,3 +1,4 @@
+import asyncio
 import base64
 
 from tau2.voice.audio_native.assemblyai.discrete_time_adapter import (
@@ -69,6 +70,7 @@ def test_barge_in_marks_truncation():
     a._process_event(r, AAISpeechStartedEvent())
     assert r.was_truncated is True
     assert "speech_started" in r.vad_events
+    assert r.skip_item_id == "r-1"
 
 
 def test_reply_done_interrupted_discards_pending_tools():
@@ -76,4 +78,33 @@ def test_reply_done_interrupted_discards_pending_tools():
     r = _result()
     a.send_tool_result("c-1", "{}")
     a._process_event(r, AAIReplyDoneEvent(reply_id="r-1", status="interrupted"))
+    assert a._pending_tool_results == []
+
+
+class FakeAssemblyAIProvider:
+    """Fake provider for testing tool result flushing."""
+
+    def __init__(self):
+        self.send_tool_result_calls = []
+
+    async def send_tool_result(self, call_id: str, result: str) -> None:
+        """Record tool result calls."""
+        self.send_tool_result_calls.append((call_id, result))
+
+
+def test_flush_sends_tool_result_without_reply_create():
+    fake_provider = FakeAssemblyAIProvider()
+    a = DiscreteTimeAssemblyAIAdapter(
+        tick_duration_ms=200, send_audio_instant=True, provider=fake_provider
+    )
+    a.send_tool_result("c-1", "{}")
+    assert len(a._pending_tool_results) == 1
+
+    # Run the async flush
+    asyncio.run(a._flush_pending_tool_results())
+
+    # Assert the fake provider received exactly one call
+    assert len(fake_provider.send_tool_result_calls) == 1
+    assert fake_provider.send_tool_result_calls[0] == ("c-1", "{}")
+    # Assert pending results were cleared
     assert a._pending_tool_results == []
