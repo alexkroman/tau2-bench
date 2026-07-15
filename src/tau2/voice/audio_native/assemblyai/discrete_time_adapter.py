@@ -190,6 +190,11 @@ class DiscreteTimeAssemblyAIAdapter(DiscreteTimeAdapter):
         result.events.append(event)
 
         if isinstance(event, AAIReplyStartedEvent):
+            # A fresh reply means any prior barge-in is resolved. Clear the skip
+            # target so this reply is heard — reply.audio frames carry no
+            # reply_id and fall back to _current_item_id, so a stale skip target
+            # would otherwise swallow the entire new reply (see test 3 mute bug).
+            result.skip_item_id = None
             if event.reply_id:
                 self._current_item_id = event.reply_id
                 self._utterance_transcripts.setdefault(
@@ -233,6 +238,11 @@ class DiscreteTimeAssemblyAIAdapter(DiscreteTimeAdapter):
 
         elif isinstance(event, AAISpeechStoppedEvent):
             result.vad_events.append("speech_stopped")
+            # User finished talking: whatever the agent says next is its reply to
+            # this turn and must be heard. Clear the barge-in skip target — a
+            # null-reply_id audio frame falls back to the stale interrupted item,
+            # so leaving skip set here mutes the agent for the rest of the call.
+            result.skip_item_id = None
 
         elif isinstance(event, AAIToolCallEvent):
             result.tool_calls.append(

@@ -10,6 +10,7 @@ from tau2.voice.audio_native.assemblyai.events import (
     AAIReplyDoneEvent,
     AAIReplyStartedEvent,
     AAISpeechStartedEvent,
+    AAISpeechStoppedEvent,
     AAIToolCallEvent,
 )
 from tau2.voice.audio_native.tick_result import TickResult
@@ -111,6 +112,53 @@ def test_skip_item_id_discards_subsequent_audio():
     )
     assert r2.agent_audio_chunks == []
     assert r2.truncated_audio_bytes == len(audio_bytes)
+
+
+def test_speech_stopped_clears_skip_so_next_reply_is_heard():
+    """Regression (aai_retail_quick task 3): after a barge-in, once the user
+    stops speaking the agent's next reply must be heard.
+
+    ``reply.audio`` frames carry ``reply_id=None`` on the wire, so item_id
+    falls back to the stale ``_current_item_id`` (the interrupted reply). If the
+    barge-in ``skip_item_id`` is never cleared, every subsequent chunk matches it
+    and the agent is muted for the rest of the session — 148,900 bytes of reply
+    audio were silently discarded and the agent never spoke again.
+    """
+    a = _adapter()
+    r = _result()
+    # Greeting reply r-1 is playing; _current_item_id becomes r-1.
+    a._process_event(r, AAIReplyStartedEvent(reply_id="r-1"))
+    a._process_event(
+        r, AAIReplyAudioEvent(audio=base64.b64encode(b"\xff" * 20).decode(), reply_id="r-1")
+    )
+    # User barges in, then stops talking.
+    a._process_event(r, AAISpeechStartedEvent())
+    assert r.skip_item_id == "r-1"
+    a._process_event(r, AAISpeechStoppedEvent())
+    assert r.skip_item_id is None
+
+    # Agent's real response arrives with a null reply_id (falls back to r-1).
+    # It must play, not be truncated.
+    audio = b"\xcd" * 16
+    a._process_event(
+        r, AAIReplyAudioEvent(audio=base64.b64encode(audio).decode(), reply_id=None)
+    )
+    # 20 greeting bytes + 16 new reply bytes; nothing truncated.
+    assert r.agent_audio_bytes == 36
+    assert r.truncated_audio_bytes == 0
+
+
+def test_new_reply_started_clears_stale_skip():
+    """A fresh reply.started means the barge-in is resolved: the stale skip
+    target must be cleared so a following null-reply_id audio chunk (which falls
+    back to the new current item) is not wrongly discarded."""
+    a = _adapter()
+    r = _result()
+    a._process_event(r, AAIReplyStartedEvent(reply_id="r-1"))
+    a._process_event(r, AAISpeechStartedEvent())
+    assert r.skip_item_id == "r-1"
+    a._process_event(r, AAIReplyStartedEvent(reply_id="r-2"))
+    assert r.skip_item_id is None
 
 
 class FakeAssemblyAIProvider:
