@@ -14,7 +14,17 @@ def test_parse_session_ready():
     assert ev.session_id == "s-123"
 
 
-def test_parse_reply_audio_keeps_base64():
+def test_parse_reply_audio_wire_format_uses_data():
+    # Live API shape: base64 payload arrives under `data`.
+    ev = parse_assemblyai_event(
+        {"type": "reply.audio", "data": "QUJD", "reply_id": "r-1"}
+    )
+    assert isinstance(ev, AAIReplyAudioEvent)
+    assert ev.audio == "QUJD"
+    assert ev.reply_id == "r-1"
+
+
+def test_parse_reply_audio_accepts_legacy_audio_field():
     ev = parse_assemblyai_event(
         {"type": "reply.audio", "audio": "QUJD", "reply_id": "r-1"}
     )
@@ -25,14 +35,35 @@ def test_parse_reply_audio_keeps_base64():
 
 def test_parse_agent_transcript_interrupted():
     ev = parse_assemblyai_event(
-        {"type": "transcript.agent", "text": "hello", "interrupted": True, "reply_id": "r-1"}
+        {
+            "type": "transcript.agent",
+            "text": "hello",
+            "interrupted": True,
+            "reply_id": "r-1",
+        }
     )
     assert isinstance(ev, AAIAgentTranscriptEvent)
     assert ev.text == "hello"
     assert ev.interrupted is True
 
 
-def test_parse_tool_call_uses_arguments():
+def test_parse_tool_call_wire_format_uses_args():
+    # Live API shape: tool arguments arrive under `args`.
+    ev = parse_assemblyai_event(
+        {
+            "type": "tool.call",
+            "call_id": "c-1",
+            "name": "lookup_order",
+            "args": {"order_id": "ORD-1"},
+        }
+    )
+    assert isinstance(ev, AAIToolCallEvent)
+    assert ev.call_id == "c-1"
+    assert ev.name == "lookup_order"
+    assert ev.arguments == {"order_id": "ORD-1"}
+
+
+def test_parse_tool_call_accepts_arguments_field():
     ev = parse_assemblyai_event(
         {
             "type": "tool.call",
@@ -42,9 +73,15 @@ def test_parse_tool_call_uses_arguments():
         }
     )
     assert isinstance(ev, AAIToolCallEvent)
-    assert ev.call_id == "c-1"
-    assert ev.name == "lookup_order"
     assert ev.arguments == {"order_id": "ORD-1"}
+
+
+def test_parse_session_updated_wire_format_uses_config():
+    ev = parse_assemblyai_event(
+        {"type": "session.updated", "config": {"system_prompt": "hi", "tools": []}}
+    )
+    assert ev.type == "session.updated"
+    assert ev.config == {"system_prompt": "hi", "tools": []}
 
 
 def test_parse_unknown_event():

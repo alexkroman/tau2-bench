@@ -2,19 +2,18 @@
 
 Reference: https://www.assemblyai.com/docs/voice-agents/voice-agent-api
 
-Field names for some events (reply.audio audio field, transcript delta text
-field) are modeled from the docs only and remain UNVERIFIED against a live
-connection — no ASSEMBLYAI_API_KEY was available to run the standalone smoke
-test against the real API. Models tolerate field-name mismatches via Optional
-fields and extra="ignore", so parsing never fails outright, but a genuine
-mismatch will silently degrade to empty/default fields until this is run
-live with a real API key.
+Field names are verified against recorded live-API messages: ``reply.audio``
+delivers its base64 payload as ``data`` (not ``audio``), ``tool.call``
+delivers its arguments as ``args`` (the protocol has also used ``arguments``;
+both are accepted, ``arguments`` wins), and ``session.updated`` echoes the
+applied config as ``config``. Models tolerate unknown fields via
+extra="ignore" so unexpected frames never crash the receive loop.
 """
 
 from typing import Any, Dict, Literal, Optional, Union
 
 from loguru import logger
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 
 class BaseAAIEvent(BaseModel):
@@ -31,7 +30,7 @@ class AAISessionReadyEvent(BaseAAIEvent):
 
 class AAISessionUpdatedEvent(BaseAAIEvent):
     type: Literal["session.updated"] = "session.updated"
-    session: Optional[Dict[str, Any]] = None
+    config: Optional[Dict[str, Any]] = None
 
 
 class AAISpeechStartedEvent(BaseAAIEvent):
@@ -61,7 +60,12 @@ class AAIReplyStartedEvent(BaseAAIEvent):
 
 class AAIReplyAudioEvent(BaseAAIEvent):
     type: Literal["reply.audio"] = "reply.audio"
-    audio: str = Field(default="", exclude=True)  # base64, in output encoding
+    # Live API sends the base64 payload as `data`; `audio` kept for compat.
+    audio: str = Field(
+        default="",
+        exclude=True,
+        validation_alias=AliasChoices("data", "audio"),
+    )
     reply_id: Optional[str] = None
 
 
@@ -82,7 +86,11 @@ class AAIToolCallEvent(BaseAAIEvent):
     type: Literal["tool.call"] = "tool.call"
     call_id: str = ""
     name: str = ""
-    arguments: Dict[str, Any] = Field(default_factory=dict)  # NOT "args"
+    # The wire format has used both names; prefer `arguments`, accept `args`.
+    arguments: Dict[str, Any] = Field(
+        default_factory=dict,
+        validation_alias=AliasChoices("arguments", "args"),
+    )
 
 
 class AAISessionErrorEvent(BaseAAIEvent):
@@ -140,8 +148,12 @@ def parse_assemblyai_event(data: Dict[str, Any]) -> AAIEvent:
     event_type = data.get("type", "unknown")
 
     log_data = data.copy()
-    if event_type == "reply.audio" and "audio" in log_data:
-        log_data["audio"] = f"<{len(log_data.get('audio', ''))} base64 chars>"
+    if event_type == "reply.audio":
+        for audio_key in ("data", "audio"):
+            if audio_key in log_data:
+                log_data[audio_key] = (
+                    f"<{len(log_data.get(audio_key, ''))} base64 chars>"
+                )
     logger.debug(f"AssemblyAI event: {event_type} - {log_data}")
 
     event_class = _EVENT_TYPE_MAP.get(event_type)
