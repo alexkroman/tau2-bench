@@ -48,6 +48,11 @@ TEXT_RE = re.compile(r"'text': (\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*')")
 # cover are supposed to keep any turn well under it.
 SLOW_FIRST_WORD_SEC = 10.0
 
+# A transcript this soon after `cancelled` belongs to the cancelled reply — text
+# past the turn's terminal frame. Later than this it is a new turn (typically a
+# false-interruption resume), which is correct behaviour, not an ordering bug.
+POST_CANCEL_WINDOW_MS = 250.0
+
 
 def _parse_events(path: Path) -> list[tuple[datetime, str, str | None]]:
     """Timestamped wire events from one sim's task.log."""
@@ -89,17 +94,26 @@ def _wire_anomalies(log_path: Path) -> dict:
             # `cancelled` is the terminal frame of an interrupted turn (a
             # cancelled reply emits no reply_done), so text after it belongs to
             # a reply the client has already flushed.
+            #
+            # Bounded by POST_CANCEL_WINDOW_MS, because a LATER transcript is a
+            # different event entirely: a false-interruption resume legitimately
+            # starts a new turn seconds after the cancel, and counting its first
+            # token as an ordering violation reported a healthy recovery as a
+            # protocol bug (measured: one at +2.89s that was a resume, alongside
+            # genuine violations at +1ms).
             for when2, kind2, text2 in events[i + 1 :]:
                 if kind2 in ("cancelled", "reply_done", "user_transcript"):
                     break
                 if kind2 == "agent_transcript":
-                    out["transcript_after_cancel"].append(
-                        {
-                            "delta_ms": round((when2 - when).total_seconds() * 1000, 1),
-                            "at": when2.strftime("%H:%M:%S.%f")[:-3],
-                            "text": (text2 or "")[:160],
-                        }
-                    )
+                    delta_ms = (when2 - when).total_seconds() * 1000
+                    if delta_ms <= POST_CANCEL_WINDOW_MS:
+                        out["transcript_after_cancel"].append(
+                            {
+                                "delta_ms": round(delta_ms, 1),
+                                "at": when2.strftime("%H:%M:%S.%f")[:-3],
+                                "text": (text2 or "")[:160],
+                            }
+                        )
                     break
 
         if kind == "user_transcript":
