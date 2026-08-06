@@ -78,6 +78,22 @@ DEFAULT_VOICE_SYNTHESIS_PROVIDER = "elevenlabs"
 DEFAULT_VOICE_TRANSCRIPTION_MODEL = "nova-3"
 DEFAULT_VOICE_MODEL = "eleven_v3"
 
+# Ceiling on TTS calls in flight at once, PROCESS-WIDE (see
+# tau2.voice.synthesis.synthesize). TTS providers cap concurrency per
+# subscription and answer 429 `concurrent_limit_exceeded` over it; ElevenLabs'
+# lower tiers allow 5. Exceeding it is not merely slower — a synthesis that
+# burns its retries is a caller utterance that arrives late or not at all, and
+# `--max-concurrency` does not bound this on its own, because a single
+# simulation fans out (OutOfTurnSpeechGenerator pre-generates its inserts in a
+# thread pool).
+#
+# Default 4, one below the common cap, leaving room for an in-flight retry.
+# This is PER PROCESS: running K benchmarks in parallel against one key allows
+# K x this, so set TAU2_TTS_MAX_CONCURRENCY to floor(cap / K) for those runs
+# (the env override is read in tau2.voice.synthesis.synthesize; this module is
+# deliberately import-free).
+DEFAULT_TTS_MAX_CONCURRENCY = 4
+
 # Text streaming (legacy)
 DEFAULT_TEXT_STREAMING_CHUNK_BY = "words"
 DEFAULT_TEXT_STREAMING_CHUNK_SIZE = 1
@@ -189,6 +205,33 @@ DEFAULT_QWEN_INPUT_SAMPLE_RATE = 16000  # fixed, API-defined
 DEFAULT_QWEN_OUTPUT_SAMPLE_RATE = 24000  # fixed, API-defined
 
 # =============================================================================
+# AAI PROVIDER (local voice-agent host; overridable URL/rates)
+# =============================================================================
+DEFAULT_AAI_WS_URL = "ws://localhost:3000/websocket"  # overridable via AAI_WS_URL
+DEFAULT_AAI_MODEL = "host"  # fixed, determined by endpoint
+# 24 kHz, NOT 16 kHz. The AssemblyAI Voice Agent API behind an S2S agent accepts
+# exactly one rate in each direction and honours no declaration to the contrary,
+# so sending 16 kHz got it decoded at 24 kHz — 1.5x fast — and the service then
+# emitted NOTHING: no speech edge, no transcript, no error. The agent greeted
+# normally and was deaf for the rest of the call, which read as a service
+# outage. That cost the retail S2S run 2/25, answering 62 of 171 user turns with
+# an unresponsive period in 25 of 25 sessions, against 15/25 and 18/25 for the
+# pipeline transports on the same tasks.
+#
+# The host now REJECTS a config frame declaring a rate it cannot honour, so this
+# no longer fails silently — but it does mean this constant and the host must
+# agree or the handshake is refused outright.
+DEFAULT_AAI_INPUT_SAMPLE_RATE = 24000  # PCM16 sent to aai (STT)
+DEFAULT_AAI_OUTPUT_SAMPLE_RATE = 24000  # PCM16 received from aai (TTS)
+DEFAULT_AAI_CONFIG_FRAME_TIMEOUT = (
+    10.0  # seconds to await the server config handshake frame
+)
+# Spoken by the host agent on session start so the call doesn't open with dead
+# air while the S2S model waits through the user's first turn. Empty string
+# disables the greeting.
+DEFAULT_AAI_GREETING = "Thank you for calling. How can I help you today?"
+
+# =============================================================================
 # PROVIDER REGISTRY (derived from above)
 # =============================================================================
 DEFAULT_AUDIO_NATIVE_MODELS = {
@@ -197,6 +240,7 @@ DEFAULT_AUDIO_NATIVE_MODELS = {
     "xai": DEFAULT_XAI_MODEL,
     "nova": DEFAULT_NOVA_MODEL,
     "qwen": DEFAULT_QWEN_MODEL,
+    "aai": DEFAULT_AAI_MODEL,
     "livekit": "dummy",
 }
 
@@ -206,6 +250,7 @@ DEFAULT_AUDIO_NATIVE_REASONING_EFFORT: dict[str, str | None] = {
     "xai": None,
     "nova": None,
     "qwen": None,
+    "aai": None,
     "livekit": None,
 }
 
@@ -215,6 +260,7 @@ AUDIO_NATIVE_PROVIDER_TYPES = {
     "xai": "audio_native",
     "nova": "audio_native",
     "qwen": "audio_native",
+    "aai": "audio_native",
     "livekit": "cascaded",
 }
 
