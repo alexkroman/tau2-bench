@@ -72,7 +72,7 @@ class AAIVoiceAgentProvider:
 
     Attributes:
         ws_url: WebSocket endpoint URL (from AAI_WS_URL env var or DEFAULT_AAI_WS_URL).
-        input_sample_rate: Sample rate for audio sent to AAI (16000 Hz).
+        input_sample_rate: Sample rate for audio sent to AAI (24000 Hz).
         tts_sample_rate: Sample rate for audio received from AAI (24000 Hz).
         system_prompt: System instructions for the voice agent.
         tools: Tools available to the voice agent.
@@ -120,7 +120,7 @@ class AAIVoiceAgentProvider:
         Args:
             ws_url: WebSocket URL for AAI host. If not provided, reads from
                 AAI_WS_URL environment variable, falling back to DEFAULT_AAI_WS_URL.
-            input_sample_rate: Sample rate for audio sent to AAI (default: 16000).
+            input_sample_rate: Sample rate for audio sent to AAI (default: 24000).
             tts_sample_rate: Sample rate for audio received from AAI (default: 24000).
             system_prompt: System instructions for the agent.
             tools: Tools available to the agent.

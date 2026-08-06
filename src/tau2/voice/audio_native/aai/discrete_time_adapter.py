@@ -5,7 +5,7 @@ difference: the aai host speaks PCM16 over its WebSocket (16kHz in, 24kHz
 out), while the adapter's external interface stays tau2 telephony mu-law/8k.
 Audio conversion therefore happens at this boundary:
 
-- Send path: mu-law 8k (external) -> PCM16 -> resample to 16kHz -> provider.
+- Send path: mu-law 8k (external) -> PCM16 -> resample to 24kHz -> provider.
 - Receive path: PCM16 24k (from provider) -> resample to 8kHz -> mu-law.
 
 aai events don't carry a reply/turn id, so a synthetic running turn id
@@ -196,7 +196,7 @@ class DiscreteTimeAAIAdapter(DiscreteTimeAdapter):
         result: TickResult,
         tick_start: float,
     ) -> None:
-        pcm16_16k = self._convert_ulaw_to_pcm16_16k(user_audio)
+        pcm16_send = self._convert_ulaw_to_pcm16_send_rate(user_audio)
 
         async def receive_events():
             elapsed = asyncio.get_running_loop().time() - tick_start
@@ -205,7 +205,7 @@ class DiscreteTimeAAIAdapter(DiscreteTimeAdapter):
 
         _, events = await asyncio.gather(
             self._send_audio_chunked(
-                pcm16_16k, self.provider.send_audio, self._chunk_size
+                pcm16_send, self.provider.send_audio, self._chunk_size
             ),
             receive_events(),
         )
@@ -213,8 +213,8 @@ class DiscreteTimeAAIAdapter(DiscreteTimeAdapter):
             self._process_event(result, event)
 
     @staticmethod
-    def _convert_ulaw_to_pcm16_16k(ulaw_8k: bytes) -> bytes:
-        """Convert mu-law 8k user audio to PCM16 16k for the aai host."""
+    def _convert_ulaw_to_pcm16_send_rate(ulaw_8k: bytes) -> bytes:
+        """Convert mu-law 8k user audio to PCM16 at AAI_SEND_SAMPLE_RATE for the host."""
         audio = AudioData(data=ulaw_8k, format=TELEPHONY_AUDIO_FORMAT)
         pcm16 = convert_to_pcm16(audio)
         resampled = resample_audio(pcm16, AAI_SEND_SAMPLE_RATE)

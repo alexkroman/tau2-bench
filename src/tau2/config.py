@@ -209,7 +209,19 @@ DEFAULT_QWEN_OUTPUT_SAMPLE_RATE = 24000  # fixed, API-defined
 # =============================================================================
 DEFAULT_AAI_WS_URL = "ws://localhost:3000/websocket"  # overridable via AAI_WS_URL
 DEFAULT_AAI_MODEL = "host"  # fixed, determined by endpoint
-DEFAULT_AAI_INPUT_SAMPLE_RATE = 16000  # PCM16 sent to aai (STT)
+# 24 kHz, NOT 16 kHz. The AssemblyAI Voice Agent API behind an S2S agent accepts
+# exactly one rate in each direction and honours no declaration to the contrary,
+# so sending 16 kHz got it decoded at 24 kHz — 1.5x fast — and the service then
+# emitted NOTHING: no speech edge, no transcript, no error. The agent greeted
+# normally and was deaf for the rest of the call, which read as a service
+# outage. That cost the retail S2S run 2/25, answering 62 of 171 user turns with
+# an unresponsive period in 25 of 25 sessions, against 15/25 and 18/25 for the
+# pipeline transports on the same tasks.
+#
+# The host now REJECTS a config frame declaring a rate it cannot honour, so this
+# no longer fails silently — but it does mean this constant and the host must
+# agree or the handshake is refused outright.
+DEFAULT_AAI_INPUT_SAMPLE_RATE = 24000  # PCM16 sent to aai (STT)
 DEFAULT_AAI_OUTPUT_SAMPLE_RATE = 24000  # PCM16 received from aai (TTS)
 DEFAULT_AAI_CONFIG_FRAME_TIMEOUT = (
     10.0  # seconds to await the server config handshake frame

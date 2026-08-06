@@ -214,11 +214,16 @@ def test_flush_pending_tool_results_sends_tool_result_only() -> None:
     assert a._pending_tool_results == []
 
 
-def test_convert_ulaw_8k_silence_to_pcm16_16k_grows_by_4x() -> None:
-    """mu-law is 1 byte/sample at 8kHz; PCM16 is 2 bytes/sample at 16kHz,
-    so converting silence should roughly quadruple the byte count."""
+def test_convert_ulaw_8k_silence_to_pcm16_send_rate_grows_by_6x() -> None:
+    """mu-law is 1 byte/sample at 8kHz; PCM16 is 2 bytes/sample at 24kHz, so
+    converting silence should roughly sextuple the byte count.
+
+    24kHz and not 16kHz because the AssemblyAI Voice Agent API behind an S2S
+    agent accepts that rate alone and honours no declaration otherwise — audio
+    at any other rate is decoded at 24kHz anyway and the service then emits
+    nothing at all. See DEFAULT_AAI_INPUT_SAMPLE_RATE."""
     ulaw_silence_8k = b"\xff" * 160  # 20ms of mu-law silence at 8kHz.
 
-    pcm16_16k = DiscreteTimeAAIAdapter._convert_ulaw_to_pcm16_16k(ulaw_silence_8k)
+    pcm16_send = DiscreteTimeAAIAdapter._convert_ulaw_to_pcm16_send_rate(ulaw_silence_8k)
 
-    assert len(pcm16_16k) == pytest.approx(160 * 4, abs=8)
+    assert len(pcm16_send) == pytest.approx(160 * 6, abs=8)

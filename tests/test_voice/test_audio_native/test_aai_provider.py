@@ -24,7 +24,7 @@ class TestAAIVoiceAgentProvider:
     def test_provider_initialization_defaults(self) -> None:
         """Test provider initializes with default values."""
         provider = AAIVoiceAgentProvider()
-        assert provider.input_sample_rate == 16000
+        assert provider.input_sample_rate == 24000
         assert provider.tts_sample_rate == 24000
         assert provider.system_prompt == ""
         assert provider.tools == ()
