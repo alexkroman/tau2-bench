@@ -192,6 +192,50 @@ def get_elevenlabs_voice_id(persona_name: str) -> str:
     return ALL_PERSONAS[persona_name].elevenlabs_voice_id
 
 
+# Persona -> AssemblyAI TTS voice, used when TAU2_TTS_PROVIDER=assemblyai.
+#
+# A hand-written table rather than a derivation, because the two catalogues
+# have nothing in common: ElevenLabs voice ids are opaque hashes and
+# AssemblyAI's are names from a fixed list of eleven English voices. The
+# mapping keeps each persona's apparent gender so a recording still matches the
+# persona's written prompt, which is what anyone debugging a turn-taking
+# failure by ear is relying on.
+#
+# `jane` is deliberately ABSENT: the agent under test speaks as `jane`
+# (`tau2-pipeline`'s `agent({ voice })`), and a caller sharing the agent's
+# voice makes a recording unreadable. Verified against
+# `ASSEMBLYAI_TTS_VOICES` — a voice id the service does not know is refused
+# IN-BAND after the socket opens, which presents as a caller that is
+# permanently silent rather than as an error.
+ASSEMBLYAI_PERSONA_VOICES: dict[str, str] = {
+    "matt_delaney": "michael",
+    "lisa_brenner": "eve",
+    "mildred_kaplan": "vera",
+    "arjun_roy": "charles",
+    "wei_lin": "anna",
+    "mamadou_diallo": "paul",
+    "priya_patil": "mary",
+}
+
+
+def get_assemblyai_voice(persona_name: str) -> str:
+    """Get the AssemblyAI TTS voice for a persona — see the table above."""
+    if persona_name not in ALL_PERSONAS:
+        raise KeyError(
+            f"Unknown persona: '{persona_name}'. Available: {ALL_PERSONA_NAMES}"
+        )
+    voice = ASSEMBLYAI_PERSONA_VOICES.get(persona_name)
+    if voice is None:
+        # Loud rather than defaulted: a persona added without a voice here
+        # would otherwise sound like whichever one the fallback picked, and the
+        # run would look fine.
+        raise KeyError(
+            f"Persona '{persona_name}' has no AssemblyAI voice in "
+            f"ASSEMBLYAI_PERSONA_VOICES (have: {sorted(ASSEMBLYAI_PERSONA_VOICES)})"
+        )
+    return voice
+
+
 def get_persona_name_by_voice_id(voice_id: str) -> Optional[str]:
     """Get persona name from ElevenLabs voice ID. Returns None if not found."""
     for persona in ALL_PERSONAS.values():

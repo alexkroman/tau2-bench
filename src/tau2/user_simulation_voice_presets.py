@@ -306,7 +306,12 @@ def sample_voice_config(
     # Sample persona (simulation-level, same speaker throughout)
     # -------------------------------------------------------------------------
     provider_config = synthesis_config.provider_config
-    voice_id = provider_config.voice_id if provider_config else None
+    # `getattr`, not attribute access: only the ElevenLabs config carries a
+    # `voice_id`, and this lookup is "did the caller pin a specific persona?"
+    # rather than "which voice". Under AssemblyAI there is no id to reverse, so
+    # the persona is sampled below — which is the same path an unpinned
+    # ElevenLabs run takes.
+    voice_id = getattr(provider_config, "voice_id", None) if provider_config else None
     persona_name = get_persona_name_by_voice_id(voice_id) if voice_id else None
     if not persona_name:
         persona_names = preset.get("persona_names", CONTROL_PERSONA_NAMES)

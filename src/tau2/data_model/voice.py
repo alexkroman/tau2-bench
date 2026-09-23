@@ -2,7 +2,7 @@
 """Voice data models for synthesis, transcription, and audio effects."""
 
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, Union
 
 from pydantic import BaseModel, Field, computed_field
 
@@ -98,7 +98,37 @@ class ElevenLabsTTSConfig(BaseModel):
     seed: Optional[int] = Field(default=None)
 
 
-ProviderConfig = ElevenLabsTTSConfig
+DEFAULT_ASSEMBLYAI_TTS_VOICE = "eve"
+DEFAULT_ASSEMBLYAI_SAMPLE_RATE = 16000
+DEFAULT_ASSEMBLYAI_AUDIO_FORMAT = AudioFormat(
+    encoding=AudioEncoding.PCM_S16LE,
+    sample_rate=DEFAULT_ASSEMBLYAI_SAMPLE_RATE,
+)
+
+
+class AssemblyAITTSConfig(BaseModel):
+    """Configuration for AssemblyAI streaming TTS — see `assemblyai_utils`.
+
+    The voice defaults to one the AGENT does not use. `tau2-pipeline` speaks as
+    `jane`, and a caller sharing the agent's voice makes a recording unreadable
+    for anyone diagnosing a turn-taking failure by ear — which is most of how
+    this benchmark gets debugged.
+
+    There is no `voice_settings` or `seed` counterpart to the ElevenLabs config:
+    the service takes `voice` and `sample_rate` as query parameters and exposes
+    no other knob, so a field here would be a setting with nothing to set.
+    """
+
+    voice: str = Field(default=DEFAULT_ASSEMBLYAI_TTS_VOICE)
+    sample_rate: int = Field(default=DEFAULT_ASSEMBLYAI_SAMPLE_RATE)
+    api_key: Optional[str] = Field(default=None)
+
+    @property
+    def output_audio_format(self) -> AudioFormat:
+        return DEFAULT_ASSEMBLYAI_AUDIO_FORMAT
+
+
+ProviderConfig = Union[ElevenLabsTTSConfig, AssemblyAITTSConfig]
 
 
 # ============================================================================
@@ -109,8 +139,18 @@ ProviderConfig = ElevenLabsTTSConfig
 class SynthesisConfig(BaseModel):
     """Voice synthesis configuration with 3-tier effect taxonomy."""
 
-    provider: str = Field(default="elevenlabs")
-    provider_config: Optional[ProviderConfig] = Field(default=ElevenLabsTTSConfig())
+    provider: str = Field(default_factory=lambda: DEFAULT_VOICE_SYNTHESIS_PROVIDER)
+    # A FACTORY, and matched to `provider`: a shared default instance would be
+    # mutated per task (`insert_audio_tags` is set on it in `from_cli_args`),
+    # and a hardcoded ElevenLabs config under `provider="assemblyai"` would be
+    # handed to the wrong synthesizer.
+    provider_config: Optional[ProviderConfig] = Field(
+        default_factory=lambda: (
+            AssemblyAITTSConfig()
+            if DEFAULT_VOICE_SYNTHESIS_PROVIDER == "assemblyai"
+            else ElevenLabsTTSConfig()
+        )
+    )
     channel_effects_config: ChannelEffectsConfig = Field(
         default_factory=ChannelEffectsConfig
     )
@@ -324,14 +364,21 @@ class VoiceSettings(BaseModel):
         no_audio_tags: bool = not ELEVENLABS_ENABLE_AUDIO_TAGS,
     ) -> "VoiceSettings":
         """Create a VoiceSettings instance from CLI arguments."""
-        if voice_synthesis_provider != "elevenlabs":
+        if voice_synthesis_provider == "elevenlabs":
+            provider_config = ElevenLabsTTSConfig()
+            provider_config.insert_audio_tags = not no_audio_tags
+            provider_config.audio_tags_probability = audio_tags_prob
+        elif voice_synthesis_provider == "assemblyai":
+            # No audio-tag knobs: the service has no tag vocabulary, so
+            # `assemblyai_utils` strips them rather than have the voice read
+            # "cough" aloud. Accepting `--audio-tags-prob` here and ignoring it
+            # would be a setting that silently does nothing.
+            provider_config = AssemblyAITTSConfig()
+        else:
             raise ValueError(
-                f"Unsupported voice synthesis provider: {voice_synthesis_provider}"
+                f"Unsupported voice synthesis provider: {voice_synthesis_provider} "
+                f"(known: assemblyai, elevenlabs)"
             )
-
-        provider_config = ElevenLabsTTSConfig()
-        provider_config.insert_audio_tags = not no_audio_tags
-        provider_config.audio_tags_probability = audio_tags_prob
 
         source_effects_config = SourceEffectsConfig(
             enable_background_noise=not no_background_noise,

@@ -12,8 +12,11 @@ from loguru import logger
 from tau2.config import DEFAULT_TELEPHONY_RATE
 from tau2.data_model.audio import AudioData
 from tau2.data_model.audio_effects import UserSpeechInsert
-from tau2.data_model.voice import SynthesisConfig
-from tau2.data_model.voice_personas import get_elevenlabs_voice_id
+from tau2.data_model.voice import AssemblyAITTSConfig, SynthesisConfig
+from tau2.data_model.voice_personas import (
+    get_assemblyai_voice,
+    get_elevenlabs_voice_id,
+)
 from tau2.voice.synthesis.audio_effects.effects import apply_constant_muffling
 from tau2.voice.synthesis.synthesize import synthesize_voice
 from tau2.voice.utils.audio_preprocessing import resample_audio
@@ -124,9 +127,17 @@ def create_streaming_audio_generators(
     out_of_turn_items = speech_config.get_out_of_turn_speech_inserts()
 
     if out_of_turn_items:
-        voice_id = get_elevenlabs_voice_id(persona_name)
+        # Out-of-turn inserts are the persona's own voice, so they take the
+        # same provider-specific field the main path does — see
+        # `agent/base/voice.py`. `voice_id` is kept for the generator's label
+        # either way; only the CONFIG differs.
         provider_config_with_voice = deepcopy(synthesis_config.provider_config)
-        provider_config_with_voice.voice_id = voice_id
+        if isinstance(provider_config_with_voice, AssemblyAITTSConfig):
+            voice_id = get_assemblyai_voice(persona_name)
+            provider_config_with_voice.voice = voice_id
+        else:
+            voice_id = get_elevenlabs_voice_id(persona_name)
+            provider_config_with_voice.voice_id = voice_id
         out_of_turn_speech_generator = OutOfTurnSpeechGenerator(
             voice_id=voice_id,
             provider=synthesis_config.provider,

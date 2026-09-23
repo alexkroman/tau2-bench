@@ -9,8 +9,11 @@ from pydantic import BaseModel
 from tau2.agent.base.streaming_utils import format_transcript_comparison
 from tau2.data_model.audio import AudioData, audio_bytes_to_string
 from tau2.data_model.message import Message
-from tau2.data_model.voice import VoiceSettings
-from tau2.data_model.voice_personas import get_elevenlabs_voice_id
+from tau2.data_model.voice import AssemblyAITTSConfig, VoiceSettings
+from tau2.data_model.voice_personas import (
+    get_assemblyai_voice,
+    get_elevenlabs_voice_id,
+)
 from tau2.voice.synthesis.audio_effects.noise_generator import (
     BackgroundNoiseGenerator,
 )
@@ -114,7 +117,14 @@ class VoiceMixin(
         speech_env = self.voice_settings.speech_environment
         synthesis_config = self.voice_settings.synthesis_config
         provider_config = deepcopy(synthesis_config.provider_config)
-        provider_config.voice_id = get_elevenlabs_voice_id(speech_env.persona_name)
+        # Which FIELD carries the persona's voice depends on the provider:
+        # ElevenLabs takes an opaque `voice_id`, AssemblyAI a `voice` name from
+        # a fixed catalogue. Assigning `voice_id` unconditionally raised
+        # `"AssemblyAITTSConfig" object has no field "voice_id"` on every turn.
+        if isinstance(provider_config, AssemblyAITTSConfig):
+            provider_config.voice = get_assemblyai_voice(speech_env.persona_name)
+        else:
+            provider_config.voice_id = get_elevenlabs_voice_id(speech_env.persona_name)
 
         # Generate per-turn effects (complexity overrides already merged into synthesis_config)
         speech_effects, source_effects, channel_effects = generate_turn_effects(

@@ -7,13 +7,12 @@ from dotenv import load_dotenv
 
 from tau2.config import DEFAULT_TTS_MAX_CONCURRENCY
 from tau2.data_model.audio import AudioData
-from tau2.data_model.voice import ElevenLabsTTSConfig
+from tau2.data_model.voice import ProviderConfig
 from tau2.utils.retry import tts_retry
+from tau2.voice.utils.assemblyai_utils import tts_assemblyai
 from tau2.voice.utils.elevenlabs_utils import tts_elevenlabs
 
 load_dotenv()
-
-ProviderConfig = ElevenLabsTTSConfig
 
 
 def _tts_concurrency_limit() -> int:
@@ -42,6 +41,19 @@ def _tts_concurrency_limit() -> int:
 _TTS_SEMAPHORE = threading.BoundedSemaphore(_tts_concurrency_limit())
 
 
+# The caller's voice, by provider name. A TABLE rather than a branch so that
+# adding one is an entry — and so the error above can NAME what it knows.
+#
+# **The two are not acoustically interchangeable**, and a run is comparable
+# only to runs using the same one: ElevenLabs v3 renders `[cough]`/`[pause]`
+# as audio and AssemblyAI has no tag vocabulary, so those markers are stripped
+# there (`assemblyai_utils`). Switching providers re-bases the baseline.
+SYNTHESIS_PROVIDERS = {
+    "elevenlabs": tts_elevenlabs,
+    "assemblyai": tts_assemblyai,
+}
+
+
 @tts_retry
 def synthesize_voice(
     text: str,
@@ -54,16 +66,20 @@ def synthesize_voice(
     requests per subscription and answer 429 over it, which costs a caller
     utterance rather than just time.
     """
-    if provider != "elevenlabs":
+    synth = SYNTHESIS_PROVIDERS.get(provider)
+    if synth is None:
         # Raised before acquiring: an unsupported provider is a config error,
         # not work, and must not queue behind in-flight synthesis.
-        raise ValueError(f"Unsupported synthesis provider: {provider}")
+        raise ValueError(
+            f"Unsupported synthesis provider: {provider} "
+            f"(known: {', '.join(sorted(SYNTHESIS_PROVIDERS))})"
+        )
 
     # Acquired INSIDE the retried function, so a backing-off attempt releases
     # its slot while it sleeps. Holding across the retry would let a few
     # rate-limited calls idle the whole allowance and stall every other caller.
     with _TTS_SEMAPHORE:
-        audio_data = tts_elevenlabs(text=text, config=provider_config)
+        audio_data = synth(text=text, config=provider_config)
 
     if not audio_data.format.is_pcm16:
         raise ValueError(
