@@ -1,3 +1,5 @@
+import os
+
 # =============================================================================
 # SIMULATION DEFAULTS (overridable via CLI)
 # =============================================================================
@@ -14,22 +16,42 @@ DEFAULT_LOG_LEVEL = "ERROR"
 # =============================================================================
 DEFAULT_AGENT_IMPLEMENTATION = "llm_agent"
 DEFAULT_USER_IMPLEMENTATION = "user_simulator"
-DEFAULT_LLM_AGENT = "gpt-4.1-2025-04-14"
-DEFAULT_LLM_USER = "gpt-4.1-2025-04-14"
+# When the AssemblyAI gateway is routing (TAU2_LLM_GATEWAY=assemblyai), the
+# model DEFAULTS have to be ids that gateway serves. It carries `gpt-4.1`, not
+# the dated `gpt-4.1-2025-04-14`, so tau2's own defaults answer
+# `400 invalid request body` on every call — which is what the routing helper
+# in `utils/llm_utils.py` deliberately does NOT paper over per call, because a
+# silent name rewrite changes which model a run measured while reporting the
+# name the caller asked for.
+#
+# Switching the DEFAULT is a different act: it is one visible decision taken by
+# enabling the gateway, in one place, rather than a rewrite hidden inside every
+# request. An explicit `--user-llm`/`--agent-llm` still wins.
+_GATEWAY = os.getenv("TAU2_LLM_GATEWAY", "").strip().lower() == "assemblyai"
+_DEFAULT_OPENAI_MODEL = "gpt-4.1" if _GATEWAY else "gpt-4.1-2025-04-14"
+
+DEFAULT_LLM_AGENT = _DEFAULT_OPENAI_MODEL
+DEFAULT_LLM_USER = _DEFAULT_OPENAI_MODEL
 DEFAULT_LLM_TEMPERATURE_AGENT = 0.0
 DEFAULT_LLM_TEMPERATURE_USER = 0.0
 DEFAULT_LLM_ARGS_AGENT = {"temperature": DEFAULT_LLM_TEMPERATURE_AGENT}
 DEFAULT_LLM_ARGS_USER = {"temperature": DEFAULT_LLM_TEMPERATURE_USER}
 
-DEFAULT_LLM_NL_ASSERTIONS = "gpt-4.1-2025-04-14"
+DEFAULT_LLM_NL_ASSERTIONS = _DEFAULT_OPENAI_MODEL
 DEFAULT_LLM_NL_ASSERTIONS_TEMPERATURE = 0.0
 DEFAULT_LLM_NL_ASSERTIONS_ARGS = {"temperature": DEFAULT_LLM_NL_ASSERTIONS_TEMPERATURE}
 
-DEFAULT_LLM_ENV_INTERFACE = "gpt-4.1-2025-04-14"
+DEFAULT_LLM_ENV_INTERFACE = _DEFAULT_OPENAI_MODEL
 DEFAULT_LLM_ENV_INTERFACE_TEMPERATURE = 0.0
 DEFAULT_LLM_ENV_INTERFACE_ARGS = {"temperature": DEFAULT_LLM_ENV_INTERFACE_TEMPERATURE}
 
-DEFAULT_LLM_EVAL_USER_SIMULATOR = "claude-opus-4-5"
+# Same rule as `_DEFAULT_OPENAI_MODEL` above: the gateway carries
+# `claude-opus-4-5-20251101`, dated, where tau2's default names the undated
+# alias. This one is the LLM JUDGE, so getting it wrong is quieter than a
+# broken turn — the run completes and only the review is missing.
+DEFAULT_LLM_EVAL_USER_SIMULATOR = (
+    "claude-opus-4-5-20251101" if _GATEWAY else "claude-opus-4-5"
+)
 
 # LLM debug logging
 DEFAULT_LLM_LOG_MODE = "latest"  # Options: "all", "latest"

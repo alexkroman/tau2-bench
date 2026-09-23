@@ -103,11 +103,21 @@ else:
     litellm.disable_cache()
 
 
-def _parse_ft_model_name(model: str) -> str:
+def _parse_ft_model_name(model: Optional[str]) -> Optional[str]:
     """
     Parse the ft model name from the litellm model name.
     e.g: "ft:gpt-4.1-mini-2025-04-14:sierra::BSQA2TFg" -> "gpt-4.1-mini-2025-04-14"
+
+    `None` passes through: an OpenAI-COMPATIBLE endpoint need not echo `model`
+    back, and the AssemblyAI gateway does not. Regexing it raised
+    `TypeError: expected string or bytes-like object, got 'NoneType'` from
+    inside cost accounting — which surfaced as
+    "Error in interruption decision" on every turn, because the policy's
+    try/except caught it and defaulted the decision. The COMPLETION had
+    succeeded; only its price was unknown.
     """
+    if model is None:
+        return None
     pattern = r"ft:(?P<model>[^:]+):(?P<provider>\w+)::(?P<id>\w+)"
     match = re.match(pattern, model)
     if match:
@@ -123,6 +133,10 @@ def get_response_cost(response: ModelResponse) -> float:
     response.model = _parse_ft_model_name(
         response.model
     )  # FIXME: Check Litellm, passing the model to completion_cost doesn't work.
+    if response.model is None:
+        # No model name, no price list entry. Returned rather than guessed: a
+        # fabricated cost would be summed into the run's reported spend.
+        return 0.0
     try:
         cost = completion_cost(completion_response=response)
     except Exception as e:
@@ -352,6 +366,55 @@ def _write_llm_log(
         json.dump(call_data, f, indent=2)
 
 
+# =============================================================================
+# AssemblyAI LLM Gateway routing
+# =============================================================================
+#
+# `TAU2_LLM_GATEWAY=assemblyai` sends every litellm call in this process — the
+# user simulator, the NL-assertion judge, the interrupt detector — to the
+# AssemblyAI LLM Gateway instead of the model's native vendor.
+#
+# It exists for the reason the TTS switch does: a metered third-party balance
+# is a single point of failure for a benchmark run, and this one bills the same
+# `ASSEMBLYAI_API_KEY` the agent under test already uses. The gateway is
+# OpenAI-compatible, so the redirect is an `api_base` plus an `openai/` prefix
+# and nothing else — verified through litellm against `gpt-5.2`, `gpt-4.1` and
+# `qwen3-next-80b-a3b`, with tools and `reasoning_effort` together.
+#
+# Two things it deliberately does NOT do:
+#
+# - **It does not rewrite model NAMES.** The gateway serves its own catalogue
+#   (`gpt-4.1`, not `gpt-4.1-2025-04-14`), and silently mapping a dated id onto
+#   an undated one would change which model a run measured while reporting the
+#   name the caller asked for. An id the gateway does not serve fails loudly
+#   with its own 400 naming the model.
+# - **It does not touch a model that already names a provider.** A caller who
+#   wrote `anthropic/...` or `openai/...` has chosen a route, and overriding it
+#   would make this switch impossible to opt out of per call.
+_LLM_GATEWAY = os.getenv("TAU2_LLM_GATEWAY", "").strip().lower()
+_ASSEMBLYAI_GATEWAY_URL = "https://llm-gateway.assemblyai.com/v1"
+
+
+def route_via_gateway(model: str, kwargs: dict) -> str:
+    """Point one litellm call at the AssemblyAI gateway. Returns the model to use.
+
+    A no-op unless `TAU2_LLM_GATEWAY=assemblyai`. Mutates `kwargs` in place to
+    add `api_base`/`api_key`, and leaves both alone if the caller set them.
+    """
+    if _LLM_GATEWAY != "assemblyai" or "/" in model:
+        return model
+    api_key = os.getenv("ASSEMBLYAI_API_KEY")
+    if not api_key:
+        raise ValueError(
+            "TAU2_LLM_GATEWAY=assemblyai requires ASSEMBLYAI_API_KEY. "
+            "Raised rather than falling back to the vendor: a silent fallback "
+            "would spend a third-party balance the switch exists to avoid."
+        )
+    kwargs.setdefault("api_base", _ASSEMBLYAI_GATEWAY_URL)
+    kwargs.setdefault("api_key", api_key)
+    return f"openai/{model}"
+
+
 def generate(
     model: str,
     messages: list[Message],
@@ -407,14 +470,20 @@ def generate(
     start_time = time.perf_counter()
     try:
         response = completion(
-            model=model,
+            model=route_via_gateway(model, kwargs),
             messages=litellm_messages,
             tools=tools_schema,
             tool_choice=tool_choice,
             **kwargs,
         )
     except Exception as e:
-        logger.error(e)
+        # The REQUEST, not just the refusal. A gateway answering
+        # "invalid request body" with no indication of which field is
+        # undiagnosable, and this is the one place that holds the payload.
+        logger.error(
+            f"{e}\n  model={model} tool_count={len(tools_schema or [])} "
+            f"tool_choice={tool_choice!r} kwargs={ {k: v for k, v in kwargs.items() if k != 'api_key'} }"
+        )
         raise e
     generation_time_seconds = time.perf_counter() - start_time
     cost = get_response_cost(response)

@@ -1,5 +1,6 @@
 import argparse
 import json
+from copy import deepcopy
 
 from tau2.config import (
     DEFAULT_AGENT_IMPLEMENTATION,
@@ -8,10 +9,10 @@ from tau2.config import (
     DEFAULT_INTEGRATION_DURATION_SECONDS,
     DEFAULT_INTERRUPTION_CHECK_INTERVAL_SECONDS,
     DEFAULT_LLM_AGENT,
+    DEFAULT_LLM_ARGS_USER,
     DEFAULT_LLM_EVAL_USER_SIMULATOR,
     DEFAULT_LLM_LOG_MODE,
     DEFAULT_LLM_TEMPERATURE_AGENT,
-    DEFAULT_LLM_TEMPERATURE_USER,
     DEFAULT_LLM_USER,
     DEFAULT_LOG_LEVEL,
     DEFAULT_MAX_CONCURRENCY,
@@ -98,8 +99,8 @@ def add_run_args(parser):
     parser.add_argument(
         "--user-llm-args",
         type=json.loads,
-        default={"temperature": DEFAULT_LLM_TEMPERATURE_USER},
-        help=f"The arguments to pass to the LLM for the user. Default is '{{\"temperature\": {DEFAULT_LLM_TEMPERATURE_USER}}}'.",
+        default=deepcopy(DEFAULT_LLM_ARGS_USER),
+        help=f"The arguments to pass to the LLM for the user. Default is '{json.dumps(DEFAULT_LLM_ARGS_USER)}'.",
     )
     parser.add_argument(
         "--task-set-name",
