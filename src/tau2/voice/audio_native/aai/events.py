@@ -118,7 +118,7 @@ class AAIAudioDoneEvent(BaseAAIEvent):
 
 
 class AAICancelledEvent(BaseAAIEvent):
-    """Session was cancelled."""
+    """The in-flight reply was abandoned (barge-in). Terminal: no reply_done follows."""
 
     type: Literal["cancelled"] = "cancelled"
 

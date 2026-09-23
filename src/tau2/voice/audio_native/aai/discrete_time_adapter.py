@@ -37,6 +37,7 @@ from tau2.voice.audio_native.aai.events import (
     AAIAgentTranscriptEvent,
     AAIAudioChunkEvent,
     AAIAudioDoneEvent,
+    AAICancelledEvent,
     AAIErrorEvent,
     AAIReplyDoneEvent,
     AAISpeechStartedEvent,
@@ -362,12 +363,22 @@ class DiscreteTimeAAIAdapter(DiscreteTimeAdapter):
             logger.debug(f"Tool call detected: {event.tool_name}({event.tool_call_id})")
 
         elif isinstance(event, AAISpeechStartedEvent):
-            logger.debug("Speech started - interruption detected")
+            # `speech_started` means "the agent yielded": the reply audio this
+            # client still holds is for a floor the host gave up, so it is
+            # flushed — `was_truncated` is what makes `buffer_excess_audio`
+            # discard the backlog instead of carrying it to the next tick.
+            #
+            # It does NOT end the reply. The host holds this edge back while
+            # its audio is on the line and releases it on a real barge-in only
+            # together with `cancelled` — so a bare `speech_started` arrives
+            # when no reply audio is playing, often while a reply is still
+            # being generated (a caller's "hello?" during a tool chain).
+            # Marking the current reply skipped here, as this adapter used to,
+            # threw that whole upcoming reply away even though the host never
+            # cancelled it. `cancelled` below is what ends a reply.
+            logger.debug("Speech started - agent yields the floor")
             result.vad_events.append("speech_started")
-            if self._buffered_agent_audio:
-                buffered = sum(len(c[0]) for c in self._buffered_agent_audio)
-                result.truncated_audio_bytes += buffered
-                self._buffered_agent_audio.clear()
+            result.was_truncated = True
             # Held audio dies here too. A duck is "not yet", but `speech_started`
             # means the host really yielded and abandoned that reply — so
             # replaying what we held would put a dead turn back on the line
@@ -378,10 +389,21 @@ class DiscreteTimeAAIAdapter(DiscreteTimeAdapter):
                     len(c[0]) for c in self._ducked_agent_audio
                 )
                 self._ducked_agent_audio = []
+
+        elif isinstance(event, AAICancelledEvent):
+            # The host abandoned the in-flight reply (a barge-in). It is
+            # terminal for that reply: no `reply_done` follows. So discard any
+            # of its audio still arriving, and start the NEXT reply on a fresh
+            # id — without the advance, the next reply inherited the skipped
+            # id and every byte of it was discarded as "truncated", however
+            # normally it finished (measured: 108s of one call unheard).
+            logger.debug("Reply cancelled - interruption")
             result.was_truncated = True
-            result.skip_item_id = self._current_item_id
             if self._current_item_id is not None:
+                result.skip_item_id = self._current_item_id
                 self._interrupted_turn_ids.add(self._current_item_id)
+                self._turn_index += 1
+                self._current_item_id = None
 
         elif isinstance(event, AAISpeechStoppedEvent):
             result.vad_events.append("speech_stopped")

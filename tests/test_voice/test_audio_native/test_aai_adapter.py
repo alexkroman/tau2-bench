@@ -17,6 +17,7 @@ from tau2.voice.audio_native.aai.discrete_time_adapter import DiscreteTimeAAIAda
 from tau2.voice.audio_native.aai.events import (
     AAIAgentTranscriptEvent,
     AAIAudioChunkEvent,
+    AAICancelledEvent,
     AAIReplyDoneEvent,
     AAISpeechStartedEvent,
     AAISpeechStoppedEvent,
@@ -106,28 +107,61 @@ def test_tool_call_recorded_with_id_name_arguments() -> None:
     assert r.tool_calls[0].arguments == {"x": 1}
 
 
-def test_speech_started_sets_truncation_and_vad_event() -> None:
+def test_speech_started_flushes_backlog_but_does_not_skip_the_reply() -> None:
+    """`speech_started` flushes what the client holds (`was_truncated` makes
+    `buffer_excess_audio` discard the backlog) but does not end the reply:
+    the host releases it bare only when no reply audio is on the line, often
+    while a reply is still being generated."""
     a = _adapter()
     r = _result()
-    a._process_event(r, AAIAgentTranscriptEvent(text="hi there"))
-    current_item_id = a._current_item_id
+    a._process_event(r, AAIAgentTranscriptEvent(text="let me check that"))
 
     a._process_event(r, AAISpeechStartedEvent())
 
     assert r.was_truncated is True
     assert "speech_started" in r.vad_events
-    assert r.skip_item_id == current_item_id
+    assert r.skip_item_id is None
 
 
-def test_speech_started_discards_buffered_agent_audio() -> None:
+def test_reply_audio_after_a_bare_speech_started_is_played() -> None:
+    """The regression: a caller's "hello?" while the reply was still being
+    generated used to mark that reply skipped, discarding all of it."""
     a = _adapter()
     r = _result()
-    a._buffered_agent_audio = [(b"\xff" * 10, "turn-0")]
-
+    a._process_event(r, AAIAgentTranscriptEvent(text="let me check that"))
     a._process_event(r, AAISpeechStartedEvent())
 
-    assert a._buffered_agent_audio == []
-    assert r.truncated_audio_bytes == 10
+    r2 = _result()
+    r2.skip_item_id = r.skip_item_id  # carried over, as the base adapter does
+    a._process_event(r2, AAIAudioChunkEvent(pcm16=(b"\x10\x00") * 480))
+
+    assert r2.agent_audio_chunks != []
+    assert r2.truncated_audio_bytes == 0
+
+
+def test_cancelled_skips_the_reply_and_starts_the_next_on_a_fresh_id() -> None:
+    """`cancelled` is terminal (no reply_done follows): stragglers of the
+    cancelled reply are discarded, and the next reply must NOT inherit its id —
+    it did, and every byte of it was then discarded as truncated."""
+    a = _adapter()
+    r = _result()
+    a._process_event(r, AAIAgentTranscriptEvent(text="your order is"))
+    cancelled_id = a._current_item_id
+    a._process_event(r, AAISpeechStartedEvent())
+    a._process_event(r, AAICancelledEvent())
+
+    assert r.skip_item_id == cancelled_id
+    assert cancelled_id in a._interrupted_turn_ids
+    assert a._current_item_id is None
+
+    # The next reply's audio plays.
+    r2 = _result()
+    r2.skip_item_id = r.skip_item_id
+    a._process_event(r2, AAIAgentTranscriptEvent(text="sure, go ahead"))
+    a._process_event(r2, AAIAudioChunkEvent(pcm16=(b"\x10\x00") * 480))
+    assert a._current_item_id != cancelled_id
+    assert r2.agent_audio_chunks != []
+    assert r2.truncated_audio_bytes == 0
 
 
 def test_speech_stopped_adds_vad_event() -> None:
@@ -183,9 +217,11 @@ def test_reply_done_on_interrupted_turn_does_not_warn(
     r = _result()
     item_id = a._ensure_current_item_id()
 
-    # Barge-in: marks the current turn as interrupted and sets skip_item_id.
-    a._process_event(r, AAISpeechStartedEvent())
+    # A cancelled barge-in marks the turn interrupted, and a late reply_done
+    # (should a host send one) must not warn about its missing audio.
+    a._process_event(r, AAICancelledEvent())
     assert item_id in a._interrupted_turn_ids
+    a._current_item_id = item_id
     caplog.clear()
 
     with caplog.at_level("WARNING"):
