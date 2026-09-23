@@ -224,3 +224,12 @@ data/simulations/.credentials/
 
 # Cursor IDE
 .cursor/
+
+# Local run outputs from voice-agent experiments. Result files record run
+# arguments verbatim, so a run launched with an `api_key` in its LLM args writes
+# the key into them — keep them out of git like data/simulations/*.
+/vpo-*
+/zztest*
+data/endpoint_sweep/
+data/vaapi_replay/
+data/.metadata_never_index
