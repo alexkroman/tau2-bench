@@ -23,6 +23,17 @@ from websockets.protocol import State
 from tau2.voice.audio_native.aai.events import AAIAudioChunkEvent
 from tau2.voice.audio_native.aai.provider import AAIVoiceAgentProvider
 
+# What a real host sends: `session.configured` always carries the rates it
+# settled on, and the provider refuses a handshake that does not.
+CONFIG_FRAME = json.dumps(
+    {
+        "type": "config",
+        "audioFormat": "pcm16",
+        "sampleRate": 16000,
+        "ttsSampleRate": 24000,
+    }
+)
+
 
 class FakeWebSocket:
     """Minimal async fake matching the websockets client surface we rely on."""
@@ -64,7 +75,7 @@ def _patch_connect(monkeypatch, fake_ws):
 
 def test_connect_completes_on_config_frame(monkeypatch):
     provider = _provider()
-    config_frame = json.dumps({"type": "config"})
+    config_frame = CONFIG_FRAME
     fake_ws = FakeWebSocket(frames=[config_frame])
     _patch_connect(monkeypatch, fake_ws)
 
@@ -80,7 +91,7 @@ def test_connect_completes_on_config_frame(monkeypatch):
 def test_connect_buffers_early_frame_for_next_receive(monkeypatch):
     provider = _provider()
     early_frame = json.dumps({"type": "agent_transcript", "text": "hello"})
-    config_frame = json.dumps({"type": "config"})
+    config_frame = CONFIG_FRAME
     fake_ws = FakeWebSocket(frames=[early_frame, config_frame])
     _patch_connect(monkeypatch, fake_ws)
 
@@ -165,7 +176,7 @@ def _capture_connect(monkeypatch, fake_ws):
 def test_connect_sends_bearer_token_when_configured(monkeypatch):
     """A deployed agent gates host mode on the owner's API key, since host mode
     replaces its prompt and tools while spending the owner's credentials."""
-    fake_ws = FakeWebSocket([json.dumps({"type": "config", "config": {}})])
+    fake_ws = FakeWebSocket([CONFIG_FRAME])
     captured = _capture_connect(monkeypatch, fake_ws)
     provider = AAIVoiceAgentProvider(
         ws_url="ws://localhost:3000/websocket", api_key="secret-key"
@@ -180,7 +191,7 @@ def test_connect_sends_bearer_token_when_configured(monkeypatch):
 
 def test_connect_reads_the_key_from_the_environment(monkeypatch):
     monkeypatch.setenv("ASSEMBLYAI_API_KEY", "env-key")
-    fake_ws = FakeWebSocket([json.dumps({"type": "config", "config": {}})])
+    fake_ws = FakeWebSocket([CONFIG_FRAME])
     captured = _capture_connect(monkeypatch, fake_ws)
     provider = AAIVoiceAgentProvider(ws_url="ws://localhost:3000/websocket")
 
@@ -193,7 +204,7 @@ def test_connect_omits_the_header_without_a_key(monkeypatch):
     """A local `aai dev` host gates on AAI_ALLOW_HOST and wants no header, so
     the usual local workflow keeps working with nothing configured."""
     monkeypatch.delenv("ASSEMBLYAI_API_KEY", raising=False)
-    fake_ws = FakeWebSocket([json.dumps({"type": "config", "config": {}})])
+    fake_ws = FakeWebSocket([CONFIG_FRAME])
     captured = _capture_connect(monkeypatch, fake_ws)
     provider = AAIVoiceAgentProvider(ws_url="ws://localhost:3000/websocket")
 

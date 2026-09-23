@@ -2,7 +2,10 @@
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from tau2.environment.tool import Tool
+from tau2.voice.audio_native.aai.events import AAIConfigEvent, parse_aai_event
 from tau2.voice.audio_native.aai.provider import (
     AAIVADConfig,
     AAIVoiceAgentProvider,
@@ -24,8 +27,9 @@ class TestAAIVoiceAgentProvider:
     def test_provider_initialization_defaults(self) -> None:
         """Test provider initializes with default values."""
         provider = AAIVoiceAgentProvider()
-        assert provider.input_sample_rate == 24000
-        assert provider.tts_sample_rate == 24000
+        # No rate until the host announces one in its handshake.
+        assert provider.input_sample_rate is None
+        assert provider.tts_sample_rate is None
         assert provider.system_prompt == ""
         assert provider.tools == ()
 
@@ -57,8 +61,34 @@ class TestAAIVoiceAgentProvider:
         assert config["ttsSampleRate"] == 24000
         assert config["host"]["systemPrompt"] == "Test prompt"
         assert config["host"]["tools"] == []
-        # A default greeting is sent so the call doesn't open with dead air.
-        assert config["host"]["greeting"]
+
+    def test_build_config_message_defaults_declare_nothing(self) -> None:
+        """Unset rates and greeting are omitted so the SDK defaults apply."""
+        config = AAIVoiceAgentProvider()._build_config_message("p", [])
+        assert "sampleRate" not in config
+        assert "ttsSampleRate" not in config
+        assert "greeting" not in config["host"]
+
+    def test_handshake_rates_are_adopted(self) -> None:
+        """The rates the host announces replace whatever was requested."""
+        provider = AAIVoiceAgentProvider(input_sample_rate=8000)
+        event = parse_aai_event(
+            {
+                "type": "session.configured",
+                "audioFormat": "pcm16",
+                "sampleRate": 16000,
+                "ttsSampleRate": 24000,
+            }
+        )
+        assert isinstance(event, AAIConfigEvent)
+        provider._adopt_negotiated_rates(event)
+        assert provider.input_sample_rate == 16000
+        assert provider.tts_sample_rate == 24000
+
+    def test_handshake_without_rates_is_refused(self) -> None:
+        provider = AAIVoiceAgentProvider()
+        with pytest.raises(RuntimeError):
+            provider._adopt_negotiated_rates(AAIConfigEvent())
 
     def test_build_config_message_greeting(self) -> None:
         """A custom greeting is forwarded; an empty greeting is omitted."""

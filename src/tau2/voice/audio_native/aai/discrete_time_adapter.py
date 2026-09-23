@@ -1,25 +1,26 @@
 """Discrete-time adapter for the AAI (AssemblyAI voice-agent host) provider.
 
 Mirrors the AssemblyAI adapter's lifecycle/tick structure, with one key
-difference: the aai host speaks PCM16 over its WebSocket (16kHz in, 24kHz
-out), while the adapter's external interface stays tau2 telephony mu-law/8k.
-Audio conversion therefore happens at this boundary:
+difference: the aai host speaks PCM16 over its WebSocket at rates IT chooses
+and announces in the handshake (the agent's SDK defaults), while the adapter's
+external interface stays tau2 telephony mu-law/8k. Audio conversion therefore
+happens at this boundary:
 
-- Send path: mu-law 8k (external) -> PCM16 -> resample to 24kHz -> provider.
-- Receive path: PCM16 24k (from provider) -> resample to 8kHz -> mu-law.
+- Send path: mu-law 8k (external) -> PCM16 -> resample to the host's input
+  rate -> provider.
+- Receive path: PCM16 at the host's output rate -> resample to 8kHz -> mu-law.
 
 aai events don't carry a reply/turn id, so a synthetic running turn id
 (``turn-N``) is maintained locally and incremented on ``reply_done``.
 """
 
 import asyncio
+import os
 from typing import Any, List, Optional
 
 from loguru import logger
 
 from tau2.config import (
-    DEFAULT_AAI_INPUT_SAMPLE_RATE,
-    DEFAULT_AAI_OUTPUT_SAMPLE_RATE,
     DEFAULT_AUDIO_NATIVE_CONNECT_TIMEOUT,
     DEFAULT_AUDIO_NATIVE_DISCONNECT_TIMEOUT,
     DEFAULT_AUDIO_NATIVE_TICK_TIMEOUT_BUFFER,
@@ -53,14 +54,25 @@ from tau2.voice.utils.audio_preprocessing import (
     resample_audio,
 )
 
-# aai host WebSocket audio rates (shared with AAIVoiceAgentProvider via
-# tau2.config so the two sides can't drift).
-AAI_SEND_SAMPLE_RATE = DEFAULT_AAI_INPUT_SAMPLE_RATE
-AAI_RECEIVE_SAMPLE_RATE = DEFAULT_AAI_OUTPUT_SAMPLE_RATE
-AAI_RECEIVE_AUDIO_FORMAT = AudioFormat(
-    encoding=AudioEncoding.PCM_S16LE,
-    sample_rate=AAI_RECEIVE_SAMPLE_RATE,
-    channels=1,
+# Experiment switch for the oracle client-side duck above.
+DUCK_ON_USER_SPEECH = os.environ.get("TAU2_CLIENT_DUCK") == "1"
+# Mean |amplitude| over a tick's PCM16 that counts as the caller speaking. Above
+# the injected background noise of `--speech-complexity regular` and well below
+# speech; logged per run so a threshold that ducks on every tick is visible
+# rather than silently flattering the result.
+USER_SPEECH_RMS_THRESHOLD = 400.0
+
+
+# Whether to send `playback_progress` to the AAI host. On by default; set
+# AAI_PLAYBACK_REPORT=0 to run the open-loop arm of an A/B. The frame is the
+# host's only closed-loop view of playback — without it the host assumes every
+# chunk it forwards starts playing on arrival at 1.0x, while this harness plays
+# bytes_per_tick per tick and buffers the rest.
+PLAYBACK_REPORT_ENABLED = os.environ.get("AAI_PLAYBACK_REPORT", "1").lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
 )
 
 
@@ -84,12 +96,21 @@ class DiscreteTimeAAIAdapter(DiscreteTimeAdapter):
         # External interface stays tau2 telephony mu-law/8k (base default);
         # PCM16 conversion happens at the WebSocket boundary, not here.
         super().__init__(tick_duration_ms, send_audio_instant=send_audio_instant)
-        self._chunk_size = int(AAI_SEND_SAMPLE_RATE * 2 * self._voip_interval_ms / 1000)
+        # Set on connect from the rates the host announces; see
+        # _apply_negotiated_rates.
+        self._send_sample_rate: Optional[int] = None
+        self._receive_audio_format: Optional[AudioFormat] = None
+        self._chunk_size = 0
         self.system_prompt = system_prompt
         self.tools = tools
         self._provider = provider
         self._owns_provider = provider is None
         self._bg_loop = BackgroundAsyncLoop()
+        # Oracle client-duck state. Held (not discarded) agent audio, plus a
+        # duck-rate counter so a threshold that fires on every tick is visible.
+        self._ducked_agent_audio: list = []
+        self._duck_ticks = 0
+        self._total_ticks = 0
         self._connected = False
         self._turn_index = 0
         # Turn ids interrupted by a barge-in (AAISpeechStartedEvent); their
@@ -128,6 +149,7 @@ class DiscreteTimeAAIAdapter(DiscreteTimeAdapter):
                 self.provider.connect(),
                 timeout=DEFAULT_AUDIO_NATIVE_CONNECT_TIMEOUT,
             )
+            self._apply_negotiated_rates()
             self._connected = True
             logger.info(
                 f"DiscreteTimeAAIAdapter connected "
@@ -152,8 +174,16 @@ class DiscreteTimeAAIAdapter(DiscreteTimeAdapter):
         self._bg_loop.stop()
         self._connected = False
         self._tick_count = 0
+        self._ducked_agent_audio: list = []
+        self._duck_ticks = 0
+        self._total_ticks = 0
         self._cumulative_user_audio_ms = 0
         self.clear_buffers()
+        if self._total_ticks:
+            logger.info(
+                f"client duck: {self._duck_ticks}/{self._total_ticks} ticks had user "
+                f"speech ({100 * self._duck_ticks / self._total_ticks:.0f}%)"
+            )
         logger.info("DiscreteTimeAAIAdapter disconnected")
 
     async def _async_disconnect(self) -> None:
@@ -196,7 +226,19 @@ class DiscreteTimeAAIAdapter(DiscreteTimeAdapter):
         result: TickResult,
         tick_start: float,
     ) -> None:
-        pcm16_send = self._convert_ulaw_to_pcm16_send_rate(user_audio)
+        pcm16_send = self._convert_ulaw_to_pcm16(user_audio, self._send_sample_rate)
+
+        # Close the host's playback loop before anything else this tick. What
+        # is already in `result.agent_audio_chunks` at this point is precisely
+        # the carry-over the base adapter prepended in step 3 — audio the host
+        # sent us that we have not played yet. Without this the host cannot
+        # observe that we consume slower than real time; see
+        # `send_playback_progress` for what it costs when it cannot.
+        backlog_bytes = sum(len(c) for c, _ in result.agent_audio_chunks)
+        if backlog_bytes and PLAYBACK_REPORT_ENABLED:
+            await self.provider.send_playback_progress(
+                backlog_bytes / self.audio_format.bytes_per_second * 1000
+            )
 
         async def receive_events():
             elapsed = asyncio.get_running_loop().time() - tick_start
@@ -212,21 +254,76 @@ class DiscreteTimeAAIAdapter(DiscreteTimeAdapter):
         for event in events:
             self._process_event(result, event)
 
+        # ── ORACLE CLIENT-SIDE DUCK (experiment) ────────────────────────────
+        # Measures the CEILING of a client-side VAD, by giving this client the
+        # one thing it does not have: instant local knowledge that the caller
+        # started talking, and instant control of its own playout.
+        #
+        # Why a ceiling is worth measuring before building anything: the
+        # server-side path cannot go faster than ~470ms (its first STT partial
+        # is a model floor) plus whatever audio is already in this client's
+        # buffer. A client that detects locally pays neither. If holding playout
+        # the instant the caller speaks does NOT reduce case-(a) truncations,
+        # no real VAD will either.
+        #
+        # Ducking, not discarding: held audio is played later, so a false
+        # positive costs a pause rather than the rest of the reply — the same
+        # reversibility argument the host-side duck rests on.
+        #
+        # NOT leaderboard-comparable. This changes the harness's own playout
+        # semantics; the number it produces is an upper bound on what our agent
+        # would gain from a capable client, not a tau2 score.
+        if DUCK_ON_USER_SPEECH:
+            if self._tick_has_user_speech(pcm16_send):
+                self._ducked_agent_audio.extend(result.agent_audio_chunks)
+                result.agent_audio_chunks.clear()
+            elif self._ducked_agent_audio:
+                result.agent_audio_chunks[:0] = self._ducked_agent_audio
+                self._ducked_agent_audio = []
+
+    def _apply_negotiated_rates(self) -> None:
+        """Size the send path and receive format from the host's handshake."""
+        send_rate = self.provider.input_sample_rate
+        receive_rate = self.provider.tts_sample_rate
+        if send_rate is None or receive_rate is None:
+            raise RuntimeError("aai provider connected without negotiated rates")
+        self._send_sample_rate = send_rate
+        self._receive_audio_format = AudioFormat(
+            encoding=AudioEncoding.PCM_S16LE, sample_rate=receive_rate, channels=1
+        )
+        self._chunk_size = int(send_rate * 2 * self._voip_interval_ms / 1000)
+
     @staticmethod
-    def _convert_ulaw_to_pcm16_send_rate(ulaw_8k: bytes) -> bytes:
-        """Convert mu-law 8k user audio to PCM16 at AAI_SEND_SAMPLE_RATE for the host."""
+    def _convert_ulaw_to_pcm16(ulaw_8k: bytes, sample_rate: int) -> bytes:
+        """Convert mu-law 8k user audio to PCM16 at the host's input rate."""
         audio = AudioData(data=ulaw_8k, format=TELEPHONY_AUDIO_FORMAT)
         pcm16 = convert_to_pcm16(audio)
-        resampled = resample_audio(pcm16, AAI_SEND_SAMPLE_RATE)
+        resampled = resample_audio(pcm16, sample_rate)
         return resampled.data
 
     @staticmethod
-    def _convert_pcm16_24k_to_ulaw_8k(pcm16_24k: bytes) -> bytes:
-        """Convert PCM16 24k agent audio (from the aai host) to mu-law 8k."""
-        audio = AudioData(data=pcm16_24k, format=AAI_RECEIVE_AUDIO_FORMAT)
+    def _convert_pcm16_to_ulaw_8k(pcm16: bytes, pcm_format: AudioFormat) -> bytes:
+        """Convert PCM16 agent audio (from the aai host) to mu-law 8k."""
+        audio = AudioData(data=pcm16, format=pcm_format)
         resampled = resample_audio(audio, 8000)
         ulaw = convert_to_ulaw(resampled)
         return ulaw.data
+
+    def _tick_has_user_speech(self, pcm16: bytes) -> bool:
+        """Oracle stand-in for a client-side VAD: is the caller talking now?"""
+        if not pcm16:
+            return False
+        import array
+
+        samples = array.array("h")
+        samples.frombytes(pcm16[: len(pcm16) - (len(pcm16) % 2)])
+        if not samples:
+            return False
+        level = sum(abs(v) for v in samples) / len(samples)
+        speaking = level > USER_SPEECH_RMS_THRESHOLD
+        self._duck_ticks += int(speaking)
+        self._total_ticks += 1
+        return speaking
 
     def _process_event(self, result: TickResult, event: Any) -> None:
         result.events.append(event)
@@ -241,7 +338,9 @@ class DiscreteTimeAAIAdapter(DiscreteTimeAdapter):
 
         elif isinstance(event, AAIAudioChunkEvent):
             item_id = self._ensure_current_item_id()
-            ulaw_bytes = self._convert_pcm16_24k_to_ulaw_8k(event.pcm16)
+            ulaw_bytes = self._convert_pcm16_to_ulaw_8k(
+                event.pcm16, self._receive_audio_format
+            )
             if result.skip_item_id is not None and item_id == result.skip_item_id:
                 result.truncated_audio_bytes += len(ulaw_bytes)
                 return
@@ -269,6 +368,16 @@ class DiscreteTimeAAIAdapter(DiscreteTimeAdapter):
                 buffered = sum(len(c[0]) for c in self._buffered_agent_audio)
                 result.truncated_audio_bytes += buffered
                 self._buffered_agent_audio.clear()
+            # Held audio dies here too. A duck is "not yet", but `speech_started`
+            # means the host really yielded and abandoned that reply — so
+            # replaying what we held would put a dead turn back on the line
+            # SECONDS late, out of context. Without this the experiment would
+            # have measured stale speech resurfacing rather than ducking.
+            if self._ducked_agent_audio:
+                result.truncated_audio_bytes += sum(
+                    len(c[0]) for c in self._ducked_agent_audio
+                )
+                self._ducked_agent_audio = []
             result.was_truncated = True
             result.skip_item_id = self._current_item_id
             if self._current_item_id is not None:

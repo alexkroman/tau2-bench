@@ -8,17 +8,15 @@ Asserts that the aai provider is properly registered in:
 - cli.py (CLI choices)
 """
 
-import pytest
-
 from tau2.agent.discrete_time_audio_native_agent import DiscreteTimeAudioNativeAgent
 from tau2.config import (
+    AUDIO_NATIVE_PROVIDER_TYPES,
     DEFAULT_AUDIO_NATIVE_MODELS,
     DEFAULT_AUDIO_NATIVE_REASONING_EFFORT,
-    AUDIO_NATIVE_PROVIDER_TYPES,
 )
 from tau2.data_model.simulation import AudioNativeConfig
-from tau2.voice.audio_native.adapter import create_adapter
 from tau2.voice.audio_native.aai.provider import AAIVADConfig
+from tau2.voice.audio_native.adapter import create_adapter
 
 
 class TestAAIConfigRegistration:

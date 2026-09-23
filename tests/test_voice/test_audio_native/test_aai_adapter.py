@@ -1,10 +1,10 @@
 """Tests for the AAI discrete-time adapter (PCM16 <-> mu-law conversion).
 
 Unlike AssemblyAI's native G.711 mu-law transport, the aai voice-agent host
-speaks PCM16 over its WebSocket (16kHz in, 24kHz out). The adapter's external
-interface stays tau2 telephony mu-law/8k, so conversion happens at this
-boundary: send path (mu-law 8k -> PCM16 16k) and receive path
-(PCM16 24k -> mu-law 8k).
+speaks PCM16 over its WebSocket at the rates it announces in its handshake. The
+adapter's external interface stays tau2 telephony mu-law/8k, so conversion
+happens at this boundary: send path (mu-law 8k -> PCM16 at the host's input
+rate) and receive path (PCM16 at the host's output rate -> mu-law 8k).
 """
 
 import asyncio
@@ -40,8 +40,15 @@ def caplog(caplog: pytest.LogCaptureFixture):
     logger.remove(handler_id)
 
 
-def _adapter() -> DiscreteTimeAAIAdapter:
-    return DiscreteTimeAAIAdapter(tick_duration_ms=200, send_audio_instant=True)
+def _adapter(
+    input_rate: int = 16000, output_rate: int = 24000
+) -> DiscreteTimeAAIAdapter:
+    """An adapter as it stands after a handshake announcing these rates."""
+    a = DiscreteTimeAAIAdapter(tick_duration_ms=200, send_audio_instant=True)
+    a.provider.input_sample_rate = input_rate
+    a.provider.tts_sample_rate = output_rate
+    a._apply_negotiated_rates()
+    return a
 
 
 def _result() -> TickResult:
@@ -214,16 +221,28 @@ def test_flush_pending_tool_results_sends_tool_result_only() -> None:
     assert a._pending_tool_results == []
 
 
-def test_convert_ulaw_8k_silence_to_pcm16_send_rate_grows_by_6x() -> None:
-    """mu-law is 1 byte/sample at 8kHz; PCM16 is 2 bytes/sample at 24kHz, so
-    converting silence should roughly sextuple the byte count.
-
-    24kHz and not 16kHz because the AssemblyAI Voice Agent API behind an S2S
-    agent accepts that rate alone and honours no declaration otherwise — audio
-    at any other rate is decoded at 24kHz anyway and the service then emits
-    nothing at all. See DEFAULT_AAI_INPUT_SAMPLE_RATE."""
+@pytest.mark.parametrize("rate,factor", [(16000, 4), (24000, 6)])
+def test_convert_ulaw_8k_silence_to_pcm16_scales_with_host_rate(
+    rate: int, factor: int
+) -> None:
+    """mu-law is 1 byte/sample at 8kHz; PCM16 is 2 bytes/sample, so the byte
+    count grows by 2 * rate / 8000 — whatever rate the host announced (16k for
+    a pipeline agent, 24k for S2S)."""
     ulaw_silence_8k = b"\xff" * 160  # 20ms of mu-law silence at 8kHz.
 
-    pcm16_send = DiscreteTimeAAIAdapter._convert_ulaw_to_pcm16_send_rate(ulaw_silence_8k)
+    pcm16_send = DiscreteTimeAAIAdapter._convert_ulaw_to_pcm16(ulaw_silence_8k, rate)
 
-    assert len(pcm16_send) == pytest.approx(160 * 6, abs=8)
+    assert len(pcm16_send) == pytest.approx(160 * factor, abs=8)
+
+
+def test_negotiated_rates_size_the_send_chunk() -> None:
+    """The VoIP chunk is sized from the host's input rate, not a constant."""
+    assert _adapter(input_rate=16000)._chunk_size * 3 == (
+        _adapter(input_rate=24000)._chunk_size * 2
+    )
+
+
+def test_apply_negotiated_rates_requires_a_handshake() -> None:
+    a = DiscreteTimeAAIAdapter(tick_duration_ms=200)
+    with pytest.raises(RuntimeError):
+        a._apply_negotiated_rates()

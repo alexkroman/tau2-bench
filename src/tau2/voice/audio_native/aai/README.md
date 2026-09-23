@@ -376,7 +376,13 @@ itself (`One moment.`) arriving 10.9s late. Covering time-to-first-token would
 need a timer armed at turn commit, independent of the model stream — a code
 change, not a setting.
 
-## Change: `languages: ["en"]` on the STT
+## Opt-in: `languages: ["en"]` on the STT (`AAI_STT_LANGUAGES=en`)
+
+As of 2026-09-22 the harness agent overrides **no** SDK default. tau2 sends no
+sample rate (it uses the pair the host announces in `session.configured`) and
+no greeting, and `agent.ts` declares a stage only when an env arm names
+something. So the English pin below is now an arm, not a baked-in setting: set
+`AAI_STT_LANGUAGES=en` to reproduce any run from before that date.
 
 An unset language is *not* English — Universal-3.5 Pro code-switches across 18
 languages, deciding per turn. Unpinned, English utterances came back

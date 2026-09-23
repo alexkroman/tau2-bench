@@ -231,27 +231,19 @@ DEFAULT_QWEN_OUTPUT_SAMPLE_RATE = 24000  # fixed, API-defined
 # =============================================================================
 DEFAULT_AAI_WS_URL = "ws://localhost:3000/websocket"  # overridable via AAI_WS_URL
 DEFAULT_AAI_MODEL = "host"  # fixed, determined by endpoint
-# 24 kHz, NOT 16 kHz. The AssemblyAI Voice Agent API behind an S2S agent accepts
-# exactly one rate in each direction and honours no declaration to the contrary,
-# so sending 16 kHz got it decoded at 24 kHz — 1.5x fast — and the service then
-# emitted NOTHING: no speech edge, no transcript, no error. The agent greeted
-# normally and was deaf for the rest of the call, which read as a service
-# outage. That cost the retail S2S run 2/25, answering 62 of 171 user turns with
-# an unresponsive period in 25 of 25 sessions, against 15/25 and 18/25 for the
-# pipeline transports on the same tasks.
-#
-# The host now REJECTS a config frame declaring a rate it cannot honour, so this
-# no longer fails silently — but it does mean this constant and the host must
-# agree or the handshake is refused outright.
-DEFAULT_AAI_INPUT_SAMPLE_RATE = 24000  # PCM16 sent to aai (STT)
-DEFAULT_AAI_OUTPUT_SAMPLE_RATE = 24000  # PCM16 received from aai (TTS)
+# No sample rates here: the harness declares none in its config frame and
+# adopts whatever the host answers in `session.configured`, so the agent's SDK
+# defaults decide (16 kHz in / 24 kHz out on the pipeline, 24/24 on S2S). The
+# rate is fixed by the host, not by us, and must never be hard-coded on this
+# side — S2S decodes every byte at 24 kHz regardless of what we declare, so a
+# mismatch leaves the agent deaf with no error.
 DEFAULT_AAI_CONFIG_FRAME_TIMEOUT = (
     10.0  # seconds to await the server config handshake frame
 )
-# Spoken by the host agent on session start so the call doesn't open with dead
-# air while the S2S model waits through the user's first turn. Empty string
-# disables the greeting.
-DEFAULT_AAI_GREETING = "Thank you for calling. How can I help you today?"
+# Empty: omitted from the host block, so the SDK's host-mode default (no
+# greeting) applies. tau2 already opens every call with its own
+# DEFAULT_FIRST_AGENT_MESSAGE, so the caller speaks first either way.
+DEFAULT_AAI_GREETING = ""
 
 # =============================================================================
 # PROVIDER REGISTRY (derived from above)

@@ -5,7 +5,8 @@ Communicates with a local AAI voice agent host via WebSocket, sending PCM16 audi
 and receiving transcripts, audio responses, and tool calls.
 
 The protocol uses:
-- Binary frames for PCM16 audio chunks (16kHz in, 24kHz out)
+- Binary frames for PCM16 audio chunks, at the rates the host announces in
+  its `session.configured` handshake frame
 - JSON frames for control messages and events
 - Server-side VAD (voice activity detection) and turn-taking
 """
@@ -24,9 +25,7 @@ from pydantic import BaseModel
 from tau2.config import (
     DEFAULT_AAI_CONFIG_FRAME_TIMEOUT,
     DEFAULT_AAI_GREETING,
-    DEFAULT_AAI_INPUT_SAMPLE_RATE,
     DEFAULT_AAI_MODEL,
-    DEFAULT_AAI_OUTPUT_SAMPLE_RATE,
     DEFAULT_AAI_WS_URL,
 )
 from tau2.utils.retry import websocket_retry
@@ -40,13 +39,6 @@ from tau2.voice.audio_native.aai.events import (
 )
 
 load_dotenv()
-
-# Audio format constants (from config)
-AAI_INPUT_SAMPLE_RATE = DEFAULT_AAI_INPUT_SAMPLE_RATE
-AAI_INPUT_BYTES_PER_SECOND = AAI_INPUT_SAMPLE_RATE * 2  # 16-bit = 2 bytes
-
-AAI_OUTPUT_SAMPLE_RATE = DEFAULT_AAI_OUTPUT_SAMPLE_RATE
-AAI_OUTPUT_BYTES_PER_SECOND = AAI_OUTPUT_SAMPLE_RATE * 2  # 16-bit samples
 
 
 class AAIVADConfig(BaseModel):
@@ -72,8 +64,10 @@ class AAIVoiceAgentProvider:
 
     Attributes:
         ws_url: WebSocket endpoint URL (from AAI_WS_URL env var or DEFAULT_AAI_WS_URL).
-        input_sample_rate: Sample rate for audio sent to AAI (24000 Hz).
-        tts_sample_rate: Sample rate for audio received from AAI (24000 Hz).
+        input_sample_rate: Sample rate for audio sent to AAI, as announced by
+            the host's handshake (None until connected).
+        tts_sample_rate: Sample rate for audio received from AAI, as announced
+            by the host's handshake (None until connected).
         system_prompt: System instructions for the voice agent.
         tools: Tools available to the voice agent.
         ws: Active WebSocket connection.
@@ -108,8 +102,8 @@ class AAIVoiceAgentProvider:
     def __init__(
         self,
         ws_url: Optional[str] = None,
-        input_sample_rate: int = DEFAULT_AAI_INPUT_SAMPLE_RATE,
-        tts_sample_rate: int = DEFAULT_AAI_OUTPUT_SAMPLE_RATE,
+        input_sample_rate: Optional[int] = None,
+        tts_sample_rate: Optional[int] = None,
         system_prompt: str = "",
         tools: tuple = (),
         greeting: str = DEFAULT_AAI_GREETING,
@@ -120,12 +114,16 @@ class AAIVoiceAgentProvider:
         Args:
             ws_url: WebSocket URL for AAI host. If not provided, reads from
                 AAI_WS_URL environment variable, falling back to DEFAULT_AAI_WS_URL.
-            input_sample_rate: Sample rate for audio sent to AAI (default: 24000).
-            tts_sample_rate: Sample rate for audio received from AAI (default: 24000).
+            input_sample_rate: Sample rate to REQUEST for audio sent to AAI.
+                Default None declares nothing, so the agent's SDK default
+                applies; either way the rate the host announces in its
+                handshake is the one used.
+            tts_sample_rate: Sample rate to REQUEST for audio received from
+                AAI. Same rule as ``input_sample_rate``.
             system_prompt: System instructions for the agent.
             tools: Tools available to the agent.
-            greeting: Spoken by the host agent on session start so the call does
-                not open with dead air. Empty string disables it.
+            greeting: Spoken by the host agent on session start. Default empty,
+                which omits it so the SDK's host-mode default (none) applies.
             api_key: Platform API key, sent as a bearer token on the upgrade.
                 Defaults to ASSEMBLYAI_API_KEY. Required only when pointing at
                 a deployed agent on the AAI platform: host mode there lets this
@@ -223,13 +221,30 @@ class AAIVoiceAgentProvider:
         }
         if self.greeting:
             host["greeting"] = self.greeting
-        return {
-            "type": "config",
-            "audioFormat": "pcm16",
-            "sampleRate": self.input_sample_rate,
-            "ttsSampleRate": self.tts_sample_rate,
-            "host": host,
-        }
+        message: Dict = {"type": "config", "audioFormat": "pcm16", "host": host}
+        # Rates are declared only when a caller asked for one. Omitted, the host
+        # picks its own and announces it in `session.configured`.
+        if self.input_sample_rate is not None:
+            message["sampleRate"] = self.input_sample_rate
+        if self.tts_sample_rate is not None:
+            message["ttsSampleRate"] = self.tts_sample_rate
+        return message
+
+    def _adopt_negotiated_rates(self, event: AAIConfigEvent) -> None:
+        """Take the audio rates from the host's handshake frame.
+
+        The host, not this client, owns the rate: an S2S agent decodes every
+        byte at its one supported rate whatever we declare. So the announced
+        numbers are adopted, and a frame without them fails the connect rather
+        than letting audio flow at a guessed rate.
+        """
+        if event.sample_rate is None or event.tts_sample_rate is None:
+            raise RuntimeError(
+                "aai host's session.configured frame carried no sampleRate/"
+                "ttsSampleRate; refusing to guess the audio rate"
+            )
+        self.input_sample_rate = event.sample_rate
+        self.tts_sample_rate = event.tts_sample_rate
 
     @websocket_retry
     async def connect(self) -> None:
@@ -255,7 +270,25 @@ class AAIVoiceAgentProvider:
 
         try:
             logger.info(f"AAI Provider: Connecting to {url}")
-            self.ws = await websockets.connect(url, additional_headers=headers)
+            # ping_timeout=None: this client's liveness is NOT established by
+            # pongs. The harness drives the socket on a 200ms tick and a dead
+            # peer therefore surfaces on the very next send as
+            # ConnectionClosed — sooner than any keepalive would notice.
+            #
+            # What the default (ping_interval=20, ping_timeout=20) actually
+            # does here is kill HEALTHY sessions. The caller's out-of-turn
+            # speech is pre-generated AFTER this socket opens, and that step
+            # blocks: measured at 50.0s with ElevenLabs across 10 concurrent
+            # sims through the 4-slot TTS semaphore. No pong goes out in that
+            # window, so every session closed itself with 1011 "keepalive ping
+            # timeout" at tick 1 and a 50-task run scored nothing. The close
+            # is logged by the HOST, which is why it reads as a server fault.
+            #
+            # Pings are kept (interval left at its default) so idle NAT paths
+            # stay open; only the verdict is removed.
+            self.ws = await websockets.connect(
+                url, additional_headers=headers, ping_timeout=None
+            )
 
             # Build and send config message
             config_msg = self._build_config_message(self.system_prompt, self.tools)
@@ -292,7 +325,12 @@ class AAIVoiceAgentProvider:
 
                 event = parse_aai_event(data)
                 if isinstance(event, AAIConfigEvent):
-                    logger.info("AAI Provider: Config acknowledged")
+                    self._adopt_negotiated_rates(event)
+                    logger.info(
+                        f"AAI Provider: Config acknowledged "
+                        f"(in={self.input_sample_rate} Hz, "
+                        f"out={self.tts_sample_rate} Hz)"
+                    )
                     break
                 if isinstance(event, AAIErrorEvent):
                     raise RuntimeError(
@@ -357,6 +395,35 @@ class AAIVoiceAgentProvider:
             "result": result,
         }
         await self.ws.send(json.dumps(message))
+
+    async def send_playback_progress(self, buffered_ms: float) -> None:
+        """Tell the host how much agent audio we still hold unplayed.
+
+        The host models playback OPEN-LOOP — it assumes every chunk it
+        forwards begins playing on arrival at exactly 1.0x — and this harness
+        does not: it plays `bytes_per_tick` per tick and buffers the rest, so
+        a reply arrives far faster than it is consumed and the backlog grows
+        across the turn. Measured, this harness drains at 0.60-0.67x real
+        time, leaving the host believing the line was silent while we still
+        held 3.8-7.3s of the reply. It then released `speech_started`, which
+        this adapter answers by discarding the whole buffer — 41% of all agent
+        audio destroyed in one run was lost that way, on edges the host's own
+        barge-in gates had ruled were not interruptions.
+
+        Advisory: the host clamps upward only, so a dropped or late report
+        costs nothing beyond a stale estimate. Failures are swallowed for the
+        same reason — a report is never worth failing a tick over.
+        """
+        if not self.is_connected:
+            return
+        try:
+            await self.ws.send(
+                json.dumps(
+                    {"type": "playback_progress", "bufferedMs": round(buffered_ms, 1)}
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - advisory frame, never fatal
+            logger.debug(f"playback_progress not sent: {exc}")
 
     async def receive_events(self) -> AsyncGenerator[BaseAAIEvent, None]:
         """Receive and yield events from the AAI WebSocket connection.

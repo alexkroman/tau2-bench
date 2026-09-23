@@ -1,0 +1,67 @@
+diff --git a/src/tau2/voice/audio_native/aai/provider.py b/src/tau2/voice/audio_native/aai/provider.py
+index 4e0da8d..70b9aeb 100644
+--- a/src/tau2/voice/audio_native/aai/provider.py
++++ b/src/tau2/voice/audio_native/aai/provider.py
+@@ -255,7 +255,25 @@ class AAIVoiceAgentProvider:
+ 
+         try:
+             logger.info(f"AAI Provider: Connecting to {url}")
+-            self.ws = await websockets.connect(url, additional_headers=headers)
++            # ping_timeout=None: this client's liveness is NOT established by
++            # pongs. The harness drives the socket on a 200ms tick and a dead
++            # peer therefore surfaces on the very next send as
++            # ConnectionClosed — sooner than any keepalive would notice.
++            #
++            # What the default (ping_interval=20, ping_timeout=20) actually
++            # does here is kill HEALTHY sessions. The caller's out-of-turn
++            # speech is pre-generated AFTER this socket opens, and that step
++            # blocks: measured at 50.0s with ElevenLabs across 10 concurrent
++            # sims through the 4-slot TTS semaphore. No pong goes out in that
++            # window, so every session closed itself with 1011 "keepalive ping
++            # timeout" at tick 1 and a 50-task run scored nothing. The close
++            # is logged by the HOST, which is why it reads as a server fault.
++            #
++            # Pings are kept (interval left at its default) so idle NAT paths
++            # stay open; only the verdict is removed.
++            self.ws = await websockets.connect(
++                url, additional_headers=headers, ping_timeout=None
++            )
+ 
+             # Build and send config message
+             config_msg = self._build_config_message(self.system_prompt, self.tools)
+@@ -358,6 +376,35 @@ class AAIVoiceAgentProvider:
+         }
+         await self.ws.send(json.dumps(message))
+ 
++    async def send_playback_progress(self, buffered_ms: float) -> None:
++        """Tell the host how much agent audio we still hold unplayed.
++
++        The host models playback OPEN-LOOP — it assumes every chunk it
++        forwards begins playing on arrival at exactly 1.0x — and this harness
++        does not: it plays `bytes_per_tick` per tick and buffers the rest, so
++        a reply arrives far faster than it is consumed and the backlog grows
++        across the turn. Measured, this harness drains at 0.60-0.67x real
++        time, leaving the host believing the line was silent while we still
++        held 3.8-7.3s of the reply. It then released `speech_started`, which
++        this adapter answers by discarding the whole buffer — 41% of all agent
++        audio destroyed in one run was lost that way, on edges the host's own
++        barge-in gates had ruled were not interruptions.
++
++        Advisory: the host clamps upward only, so a dropped or late report
++        costs nothing beyond a stale estimate. Failures are swallowed for the
++        same reason — a report is never worth failing a tick over.
++        """
++        if not self.is_connected:
++            return
++        try:
++            await self.ws.send(
++                json.dumps(
++                    {"type": "playback_progress", "bufferedMs": round(buffered_ms, 1)}
++                )
++            )
++        except Exception as exc:  # noqa: BLE001 - advisory frame, never fatal
++            logger.debug(f"playback_progress not sent: {exc}")
++
+     async def receive_events(self) -> AsyncGenerator[BaseAAIEvent, None]:
+         """Receive and yield events from the AAI WebSocket connection.
+ 

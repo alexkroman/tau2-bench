@@ -24,9 +24,16 @@ class BaseAAIEvent(BaseModel):
 
 
 class AAIConfigEvent(BaseAAIEvent):
-    """Server configuration acknowledgment."""
+    """Server configuration acknowledgment (`session.configured`).
+
+    Carries the audio rates the host settled on — the ones this client must
+    send and expect, whatever it asked for.
+    """
 
     type: Literal["config"] = "config"
+    audio_format: Optional[str] = Field(default=None, alias="audioFormat")
+    sample_rate: Optional[int] = Field(default=None, alias="sampleRate")
+    tts_sample_rate: Optional[int] = Field(default=None, alias="ttsSampleRate")
 
 
 # =============================================================================
@@ -154,6 +161,18 @@ class AAICustomEvent(BaseAAIEvent):
 # =============================================================================
 
 
+class AAISpeechSuspectedEvent(BaseAAIEvent):
+    """The host MIGHT have heard the caller start; it ducked rather than yielded."""
+
+    type: Literal["speech_suspected"] = "speech_suspected"
+
+
+class AAISpeechDismissedEvent(BaseAAIEvent):
+    """A duck taken back: the host resumed the reply it had paused."""
+
+    type: Literal["speech_dismissed"] = "speech_dismissed"
+
+
 class AAITimeoutEvent(BaseAAIEvent):
     """Timeout waiting for events (used internally, not from server)."""
 
@@ -197,7 +216,70 @@ _EVENT_TYPE_MAP: dict[str, type[BaseAAIEvent]] = {
     "error": AAIErrorEvent,
     "custom_event": AAICustomEvent,
     "timeout": AAITimeoutEvent,
+    # Logged and otherwise ignored: this harness does not act on a duck (it has
+    # no pause/resume for its playout buffer), so the server-side pacer pause is
+    # the whole mechanism under test and these are here for OBSERVABILITY.
+    "speech_suspected": AAISpeechSuspectedEvent,
+    "speech_dismissed": AAISpeechDismissedEvent,
 }
+
+
+# =============================================================================
+# Wire-name translation (AAI protocol vocabulary, 2026-09)
+# =============================================================================
+
+# The AAI SDK renamed every session event from a flat name to `noun.verb-past`
+# ("every event is `noun.verb-past`, and that is a decision about API" in
+# packages/aai/src/sdk/protocol-events.ts). The FIELDS did not change — `text`,
+# `toolCallId`, `toolName`, `args`, `result`, `code`, `message` all still
+# arrive under those names — so the whole drift is the discriminator, and the
+# models above stay as they are.
+#
+# Translating at parse time rather than renaming the models keeps the flat
+# names as this integration's internal vocabulary: the discrete-time adapter,
+# the tick-level trajectory format, the interaction metrics, and the per-run
+# scripts in scripts/ all key off them, and scripts/latency.py in particular
+# scrapes `AAI event: <name>` out of the task log with a `[a-z_]+` pattern that
+# a dotted name would not match. One dict here beats five call-site renames and
+# a silent regex miss.
+#
+# Not translating this cost a whole run: every task failed with "aai host did
+# not send a config frame within 10.0s" while the host log said the session was
+# ready, because the ack now arrives as `session.configured`.
+_WIRE_ALIASES: dict[str, str] = {
+    # The reversible duck pair. Mapped to `custom_event`-shaped no-ops purely so
+    # they are LOGGED: an unknown type returns early from parse_aai_event before
+    # the log line, so a duck that fired was indistinguishable from one that did
+    # not — which is exactly what made the first duck run unverifiable.
+    "speech.suspected": "speech_suspected",
+    "speech.dismissed": "speech_dismissed",
+    "session.configured": "config",
+    "speech.started": "speech_started",
+    "speech.stopped": "speech_stopped",
+    "user-transcript.committed": "user_transcript",
+    "agent-transcript.committed": "agent_transcript",
+    "tool.called": "tool_call",
+    "tool.completed": "tool_call_done",
+    "reply.completed": "reply_done",
+    "audio.completed": "audio_done",
+    "reply.cancelled": "cancelled",
+    "session.reset": "reset",
+    "session.timed-out": "idle_timeout",
+    "error.reported": "error",
+    "custom.emitted": "custom_event",
+}
+
+# The two INTERIM streams are dropped deliberately, and this is the one place
+# the choice is visible. `agent-transcript.updated` / `user-transcript.updated`
+# carry the partial text for the turn in progress; the flat `agent_transcript`
+# this integration was written against was the COMMITTED text, so mapping the
+# updated stream to it as well would double every agent utterance in the
+# caller-heard concatenation and move the response-latency measurement onto the
+# first partial rather than the settled sentence. They fall through to
+# AAIUnknownEvent, which the adapter ignores.
+_IGNORED_WIRE_EVENTS: frozenset[str] = frozenset(
+    {"agent-transcript.updated", "user-transcript.updated"}
+)
 
 
 # =============================================================================
@@ -215,7 +297,12 @@ def parse_aai_event(data: dict) -> BaseAAIEvent:
         Typed event instance. Unknown types return AAIUnknownEvent.
         Parse failures return AAIUnknownEvent with warning logged.
     """
-    event_type = data.get("type", "unknown")
+    wire_type = data.get("type", "unknown")
+    event_type = _WIRE_ALIASES.get(wire_type, wire_type)
+    if event_type != wire_type:
+        # The models are keyed by the flat name and validate `type` as a
+        # Literal, so the payload has to carry the translated name too.
+        data = {**data, "type": event_type}
     event_class = _EVENT_TYPE_MAP.get(event_type)
 
     if event_class is None:
