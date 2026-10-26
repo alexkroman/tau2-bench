@@ -243,6 +243,11 @@ _EVENT_TYPE_MAP: dict[str, type[BaseAAIEvent]] = {
 # a dotted name would not match. One dict here beats five call-site renames and
 # a silent regex miss.
 #
+# The SDK later camelCased the multi-word nouns (`user-transcript.committed` ->
+# `userTranscript.committed`, `session.timed-out` -> `session.timedOut`). Missing
+# that zeroed a run: every agent reply arrived as AAIUnknownEvent, so the caller
+# heard nothing after the greeting and hung up on every task.
+#
 # Not translating this cost a whole run: every task failed with "aai host did
 # not send a config frame within 10.0s" while the host log said the session was
 # ready, because the ack now arrives as `session.configured`.
@@ -256,21 +261,21 @@ _WIRE_ALIASES: dict[str, str] = {
     "session.configured": "config",
     "speech.started": "speech_started",
     "speech.stopped": "speech_stopped",
-    "user-transcript.committed": "user_transcript",
-    "agent-transcript.committed": "agent_transcript",
+    "userTranscript.committed": "user_transcript",
+    "agentTranscript.committed": "agent_transcript",
     "tool.called": "tool_call",
     "tool.completed": "tool_call_done",
     "reply.completed": "reply_done",
     "audio.completed": "audio_done",
     "reply.cancelled": "cancelled",
     "session.reset": "reset",
-    "session.timed-out": "idle_timeout",
+    "session.timedOut": "idle_timeout",
     "error.reported": "error",
     "custom.emitted": "custom_event",
 }
 
 # The two INTERIM streams are dropped deliberately, and this is the one place
-# the choice is visible. `agent-transcript.updated` / `user-transcript.updated`
+# the choice is visible. `agentTranscript.updated` / `userTranscript.updated`
 # carry the partial text for the turn in progress; the flat `agent_transcript`
 # this integration was written against was the COMMITTED text, so mapping the
 # updated stream to it as well would double every agent utterance in the
@@ -278,7 +283,7 @@ _WIRE_ALIASES: dict[str, str] = {
 # first partial rather than the settled sentence. They fall through to
 # AAIUnknownEvent, which the adapter ignores.
 _IGNORED_WIRE_EVENTS: frozenset[str] = frozenset(
-    {"agent-transcript.updated", "user-transcript.updated"}
+    {"agentTranscript.updated", "userTranscript.updated"}
 )
 
 
