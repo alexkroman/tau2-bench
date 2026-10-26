@@ -6,7 +6,6 @@ from typing import Generic, TypeVar
 from loguru import logger
 from pydantic import BaseModel
 
-from tau2.agent.base.streaming_utils import format_transcript_comparison
 from tau2.data_model.audio import AudioData, audio_bytes_to_string
 from tau2.data_model.message import Message
 from tau2.data_model.voice import AssemblyAITTSConfig, VoiceSettings
@@ -14,6 +13,7 @@ from tau2.data_model.voice_personas import (
     get_assemblyai_voice,
     get_elevenlabs_voice_id,
 )
+from tau2.utils.transcript.audio_text import format_transcript_comparison
 from tau2.voice.synthesis.audio_effects.noise_generator import (
     BackgroundNoiseGenerator,
 )
@@ -22,6 +22,7 @@ from tau2.voice.synthesis.audio_effects.scheduler import generate_turn_effects
 from tau2.voice.synthesis.synthesize import synthesize_voice
 from tau2.voice.transcription.transcribe import transcribe_audio
 from tau2.voice.utils.audio_io import save_wav_file
+from tau2.voice.utils.pronunciation_swap import apply_pronunciations
 from tau2.voice.utils.text_effects import insert_speech_text
 
 # Generic type variables for streaming mixins
@@ -124,7 +125,9 @@ class VoiceMixin(
         if isinstance(provider_config, AssemblyAITTSConfig):
             provider_config.voice = get_assemblyai_voice(speech_env.persona_name)
         else:
-            provider_config.voice_id = get_elevenlabs_voice_id(speech_env.persona_name)
+            provider_config.voice_id = speech_env.voice_id or get_elevenlabs_voice_id(
+                speech_env.persona_name
+            )
 
         # Generate per-turn effects (complexity overrides already merged into synthesis_config)
         speech_effects, source_effects, channel_effects = generate_turn_effects(
@@ -134,6 +137,14 @@ class VoiceMixin(
         )
 
         text_to_synthesize = message.content
+        if self.voice_settings.pronunciation_map:
+            text_to_synthesize, _ = apply_pronunciations(
+                text_to_synthesize,
+                self.voice_settings.pronunciation_map,
+                grapheme_tokens=tuple(
+                    self.voice_settings.pronunciation_grapheme_tokens
+                ),
+            )
         speech_config = synthesis_config.speech_effects_config
         text_effects_rng = random.Random(speech_env.voice_seed + effects_turn_idx)
 
@@ -144,6 +155,18 @@ class VoiceMixin(
                 rng=text_effects_rng,
                 min_words=speech_config.min_words_for_vocal_tics,
                 in_turn=True,
+            )
+
+        if synthesis_config.spelled_entity_tables is not None:
+            # PT-BR TTS consistently mispronounces spelled-out letter names.
+            # Apply pack pronunciation hints only to the TTS input; keep the
+            # original message text unchanged.
+            from tau2.voice.spelled_entity_normalizer import (
+                normalize_spelled_entities,
+            )
+
+            text_to_synthesize = normalize_spelled_entities(
+                text_to_synthesize, synthesis_config.spelled_entity_tables
             )
 
         audio_data = synthesize_voice(

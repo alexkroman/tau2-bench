@@ -6,6 +6,7 @@ Uses the google-genai library for real-time bidirectional audio communication.
 
 import asyncio
 import os
+import re
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
@@ -19,8 +20,10 @@ from tau2.config import (
     DEFAULT_GEMINI_MODEL,
     DEFAULT_GEMINI_OUTPUT_SAMPLE_RATE,
     DEFAULT_GEMINI_PROACTIVE_AUDIO,
+    DEFAULT_GEMINI_TRANSCRIPTION_LANGUAGE_CODES,
     DEFAULT_GEMINI_VOICE,
 )
+from tau2.data_model.language import cross_lingual
 from tau2.environment.tool import Tool
 from tau2.utils.retry import websocket_retry
 from tau2.voice.audio_native.gemini.events import (
@@ -35,7 +38,9 @@ from tau2.voice.audio_native.gemini.events import (
     GeminiTextDeltaEvent,
     GeminiTurnCompleteEvent,
     GeminiUnknownEvent,
+    GeminiUsageEvent,
 )
+from tau2.voice.audio_native.languages import gemini_language_code
 
 load_dotenv()
 
@@ -44,6 +49,43 @@ GEMINI_INPUT_SAMPLE_RATE = DEFAULT_GEMINI_INPUT_SAMPLE_RATE
 GEMINI_OUTPUT_SAMPLE_RATE = DEFAULT_GEMINI_OUTPUT_SAMPLE_RATE
 GEMINI_INPUT_BYTES_PER_SECOND = GEMINI_INPUT_SAMPLE_RATE * 2  # 16-bit = 2 bytes
 GEMINI_OUTPUT_BYTES_PER_SECOND = GEMINI_OUTPUT_SAMPLE_RATE * 2
+
+
+def require_extended_thinking_sdk(model: str) -> None:
+    """Reject SDKs too old for Gemini extended-thinking Live runs."""
+    if "gemini-3.8-live-extended-thinking" not in model.lower():
+        return
+    try:
+        from google import genai
+    except ImportError as exc:
+        raise ImportError(
+            "Gemini extended thinking requires google-genai>=2.30.1"
+        ) from exc
+    version = getattr(genai, "__version__", "")
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", version)
+    if match is None or tuple(map(int, match.groups())) < (2, 30, 1):
+        raise ValueError(
+            "Gemini extended thinking requires google-genai>=2.30.1; "
+            f"imported google.genai {version or 'unknown'} from {genai.__file__}"
+        )
+
+
+def gemini_speech_language_code(model: str, language: Optional[str]) -> Optional[str]:
+    """Return a speech language only for the documented half-cascade model.
+
+    Native-audio models do not support an explicit speech language code:
+    https://ai.google.dev/gemini-api/docs/live-api/capabilities
+    The half-cascade model documents this setting here:
+    https://cloud.google.com/vertex-ai/generative-ai/docs/live-api/configure-language-voice?hl=pt-br
+    Unknown models omit it rather than assuming that they accept this field.
+    """
+    if model.rsplit("/", 1)[-1] != "gemini-live-2.5-flash":
+        return None
+    return (
+        gemini_language_code(language)
+        if language is not None and cross_lingual(language)
+        else None
+    )
 
 
 class GeminiVADMode(str, Enum):
@@ -121,14 +163,17 @@ class GeminiLiveProvider:
         return "gemini-3.1" in model.lower()
 
     @staticmethod
-    def _supports_proactive_audio(model: str) -> bool:
-        """Return whether the given Gemini model supports proactive audio."""
-        return not GeminiLiveProvider._is_gemini_31(model)
+    def _uses_extended_thinking(model: str) -> bool:
+        """Return whether Live uses asynchronous interaction boundaries."""
+        return "gemini-3.8-live-extended-thinking" in model.lower()
 
     @staticmethod
-    def _supports_input_audio_transcription(model: str) -> bool:
-        """Return whether the given Gemini model supports input transcription."""
-        return not GeminiLiveProvider._is_gemini_31(model)
+    def _supports_proactive_audio(model: str) -> bool:
+        """Return whether the given Gemini model supports proactive audio."""
+        return not (
+            GeminiLiveProvider._is_gemini_31(model)
+            or GeminiLiveProvider._uses_extended_thinking(model)
+        )
 
     @staticmethod
     def _uses_eap_input_path(model: str) -> bool:
@@ -142,9 +187,11 @@ class GeminiLiveProvider:
         reasoning_effort: Optional[str] = None,
         project_id: Optional[str] = None,
         location: Optional[str] = None,
+        input_sample_rate: Optional[int] = None,
         use_raw_json_schema: bool = True,
         max_resumptions: int = 3,
         resume_only_on_timeout: bool = True,
+        transcription_language_codes: Optional[List[str]] = None,
     ):
         """Initialize the Gemini Live provider.
 
@@ -159,6 +206,8 @@ class GeminiLiveProvider:
             project_id: Google Cloud project ID for Vertex AI. Reads from
                 GOOGLE_CLOUD_PROJECT env var if not provided.
             location: Google Cloud region for Vertex AI. Defaults to us-central1.
+            input_sample_rate: Input audio sample rate in Hz. If None, defaults
+                to GEMINI_INPUT_SAMPLE_RATE (8000).
             use_raw_json_schema: If True (default), pass tool schemas directly
                 using parametersJsonSchema (lets SDK handle $ref/$defs).
                 If False, manually resolve $ref/$defs before passing.
@@ -169,6 +218,9 @@ class GeminiLiveProvider:
                 when the connection closes due to the planned ~10 minute timeout
                 (indicated by a GoAway message). If False, attempt resumption
                 on any connection close.
+            transcription_language_codes: BCP-47 language hints for input audio
+                transcription. Defaults to DEFAULT_GEMINI_TRANSCRIPTION_LANGUAGE_CODES.
+                Pass an empty list to use automatic language detection.
 
         Raises:
             ValueError: If no credentials are available.
@@ -277,6 +329,15 @@ class GeminiLiveProvider:
             )
 
         self.reasoning_effort = reasoning_effort
+        self._explicit_transcription_language_codes = (
+            transcription_language_codes is not None
+        )
+        self.transcription_language_codes = (
+            transcription_language_codes
+            if transcription_language_codes is not None
+            else list(DEFAULT_GEMINI_TRANSCRIPTION_LANGUAGE_CODES)
+        )
+        self.input_sample_rate = input_sample_rate or GEMINI_INPUT_SAMPLE_RATE
 
         self._client = None
         self._session = None
@@ -311,6 +372,8 @@ class GeminiLiveProvider:
         if self._client is None:
             try:
                 from google import genai
+
+                require_extended_thinking_sdk(self.model)
 
                 if self.use_vertex_ai:
                     # Vertex AI mode - uses ADC (Application Default Credentials)
@@ -353,6 +416,7 @@ class GeminiLiveProvider:
         vad_config: Optional[GeminiVADConfig] = None,
         modality: str = "audio",
         voice: Optional[str] = None,
+        language: Optional[str] = None,
         _resumption_handle: Optional[str] = None,
     ) -> None:
         """Connect to the Gemini Live API and configure the session.
@@ -365,6 +429,8 @@ class GeminiLiveProvider:
                 - "audio": Audio input and audio output.
                 - "text": Text-only output (audio input still supported).
             voice: Voice name for audio output. Defaults to DEFAULT_VOICE.
+            language: Resolved run language; speech-language codes are sent only
+                for the documented half-cascade model, never native audio.
             _resumption_handle: Internal parameter for session resumption.
                 Pass the handle from a previous session to resume it.
             proactive_audio: If True, allow model to ignore irrelevant audio input.
@@ -388,6 +454,7 @@ class GeminiLiveProvider:
             "vad_config": vad_config,
             "modality": modality,
             "voice": voice,
+            "language": language,
         }
 
         # Reset resumption count on fresh connect (not a resumption)
@@ -424,13 +491,17 @@ class GeminiLiveProvider:
 
             # Add speech config for audio modality
             if modality == "audio":
-                config_kwargs["speech_config"] = types.SpeechConfig(
+                speech_config = types.SpeechConfig(
                     voice_config=types.VoiceConfig(
                         prebuilt_voice_config=types.PrebuiltVoiceConfig(
                             voice_name=voice
                         )
                     )
                 )
+                language_code = gemini_speech_language_code(self.model, language)
+                if language_code is not None:
+                    speech_config.language_code = language_code
+                config_kwargs["speech_config"] = speech_config
 
             # Add tools if any
             if tool_declarations:
@@ -447,7 +518,9 @@ class GeminiLiveProvider:
                 # Enable context window compression for long sessions.
                 # Leave parameters unset so the API uses model-dependent defaults.
                 config_kwargs["context_window_compression"] = (
-                    types.ContextWindowCompressionConfig()
+                    types.ContextWindowCompressionConfig(
+                        sliding_window=types.SlidingWindow()
+                    )
                 )
 
             # Add session resumption config (enables receiving resumption handles)
@@ -461,12 +534,15 @@ class GeminiLiveProvider:
                         f"({self._resumption_count}/{self._max_resumptions})"
                     )
 
-            # Gemini 3.1 audio EAP currently supports output transcription only.
-            if vad_config.enable_input_transcription and (
-                self._supports_input_audio_transcription(self.model)
-            ):
+            transcription_codes = self.transcription_language_codes
+            if language is not None and not self._explicit_transcription_language_codes:
+                transcription_codes = [gemini_language_code(language)]
+            # Speech generation and input transcription have separate hint support.
+            if vad_config.enable_input_transcription:
                 config_kwargs["input_audio_transcription"] = (
-                    types.AudioTranscriptionConfig()
+                    types.AudioTranscriptionConfig(language_codes=transcription_codes)
+                    if transcription_codes
+                    else types.AudioTranscriptionConfig()
                 )
 
             # Always enable output audio transcription to get text of what Gemini says
@@ -474,7 +550,7 @@ class GeminiLiveProvider:
                 types.AudioTranscriptionConfig()
             )
 
-            # Gemini 3.1 audio EAP does not yet support proactive audio.
+            # Gemini 3.1 and 3.8 Extended Thinking do not support proactive audio.
             if DEFAULT_GEMINI_PROACTIVE_AUDIO and self._supports_proactive_audio(
                 self.model
             ):
@@ -486,6 +562,14 @@ class GeminiLiveProvider:
                 config_kwargs["thinking_config"] = types.ThinkingConfig(
                     thinking_level=self.reasoning_effort.upper(),
                 )
+
+            config_kwargs["realtime_input_config"] = types.RealtimeInputConfig(
+                automatic_activity_detection=types.AutomaticActivityDetection(
+                    start_of_speech_sensitivity=(
+                        types.StartSensitivity.START_SENSITIVITY_HIGH
+                    ),
+                )
+            )
 
             config = types.LiveConnectConfig(**config_kwargs)
 
@@ -609,6 +693,24 @@ class GeminiLiveProvider:
             logger.error(f"Session resumption failed: {e}")
             return False
 
+    def _goaway_deadline_elapsed(self) -> bool:
+        """Whether a GoAway deadline has passed without the receive loop acting.
+
+        The receive loop only re-checks `_reconnect_deadline` when a response
+        arrives (it is otherwise blocked in `async for response in turn`). If
+        the server goes silent after sending GoAway, that check never runs and
+        the reconnection window is missed entirely. The adapter polls this from
+        its own tick loop, which keeps running independently of the receive
+        task, so the deadline is honored either way.
+        """
+        if not self._reconnect_at_turn_boundary or self._reconnect_deadline is None:
+            return False
+        try:
+            now = asyncio.get_running_loop().time()
+        except RuntimeError:  # no running loop (called from sync context)
+            return False
+        return now >= self._reconnect_deadline
+
     @property
     def needs_reconnection(self) -> bool:
         """Whether a GoAway reconnection is pending.
@@ -616,7 +718,7 @@ class GeminiLiveProvider:
         The adapter should check this at the start of each tick and call
         perform_pending_reconnection() before any session I/O.
         """
-        return self._pending_reconnection
+        return self._pending_reconnection or self._goaway_deadline_elapsed()
 
     async def perform_pending_reconnection(self) -> bool:
         """Perform a pending GoAway reconnection.
@@ -629,7 +731,17 @@ class GeminiLiveProvider:
             True if reconnection succeeded, False otherwise.
         """
         if not self._pending_reconnection:
-            return True
+            if not self._goaway_deadline_elapsed():
+                return True
+            # GoAway deadline expired while the receive loop sat blocked on a
+            # silent server. Take over the reconnection here.
+            logger.warning(
+                "GoAway deadline elapsed without the receive loop reacting "
+                "(server silent); forcing reconnection at tick boundary"
+            )
+            self._reconnect_at_turn_boundary = False
+            self._reconnect_deadline = None
+            self._pending_reconnection = True
 
         self._pending_reconnection = False
 
@@ -754,6 +866,11 @@ class GeminiLiveProvider:
         from google.genai import types
 
         formatted_tools = []
+        behavior = (
+            types.Behavior.NON_BLOCKING
+            if self._uses_extended_thinking(self.model)
+            else None
+        )
         for tool in tools:
             schema = tool.openai_schema
             parameters = schema["function"]["parameters"]
@@ -765,6 +882,7 @@ class GeminiLiveProvider:
                         name=schema["function"]["name"],
                         description=schema["function"]["description"],
                         parametersJsonSchema=parameters,
+                        behavior=behavior,
                     )
                 )
             else:
@@ -778,6 +896,7 @@ class GeminiLiveProvider:
                         name=schema["function"]["name"],
                         description=schema["function"]["description"],
                         parameters=parameters,
+                        behavior=behavior,
                     )
                 )
         return formatted_tools
@@ -844,6 +963,8 @@ class GeminiLiveProvider:
                     # Consume all responses from this turn
                     response_count = 0
                     deadline_forced_break = False
+                    last_response_completed_audio_turn = False
+                    interaction_completed_in_iterator = False
                     async for response in turn:
                         if self._stop_receive:
                             break
@@ -851,8 +972,37 @@ class GeminiLiveProvider:
                         response_count += 1
                         # Parse and queue events
                         events = self._parse_response(response)
+                        interaction_completed_in_iterator |= any(
+                            isinstance(event, GeminiTurnCompleteEvent)
+                            for event in events
+                        )
                         for event in events:
                             await self._event_queue.put(event)
+
+                        # An extended-thinking interaction can contain several
+                        # spoken turns in one receive() iterator. Rotate the audio
+                        # item at each turn boundary so later speech is not
+                        # discarded with an interrupted earlier item.
+                        server_content = getattr(response, "server_content", None)
+                        last_response_completed_audio_turn = bool(
+                            server_content
+                            and getattr(server_content, "turn_complete", False)
+                        )
+                        if last_response_completed_audio_turn:
+                            if not any(
+                                isinstance(event, GeminiTurnCompleteEvent)
+                                for event in events
+                            ):
+                                await self._event_queue.put(
+                                    GeminiTurnCompleteEvent(type="turn.complete")
+                                )
+                            await self._event_queue.put(
+                                GeminiAudioDoneEvent(
+                                    type="audio.done",
+                                    item_id=self._current_item_id,
+                                )
+                            )
+                            self._current_item_id = self._generate_item_id()
 
                         # If GoAway was received and the deadline is approaching,
                         # force-break to reconnect before the server disconnects us.
@@ -871,11 +1021,17 @@ class GeminiLiveProvider:
 
                     logger.debug(f"Turn completed with {response_count} responses")
 
-                    # Emit turn complete unless we force-broke mid-turn
-                    if not self._stop_receive and not deadline_forced_break:
-                        await self._event_queue.put(
-                            GeminiTurnCompleteEvent(type="turn.complete")
-                        )
+                    # Older SDKs end receive() at a turn boundary. Avoid
+                    # duplicating a boundary emitted from the final response.
+                    if (
+                        not self._stop_receive
+                        and not deadline_forced_break
+                        and not last_response_completed_audio_turn
+                    ):
+                        if not interaction_completed_in_iterator:
+                            await self._event_queue.put(
+                                GeminiTurnCompleteEvent(type="turn.complete")
+                            )
                         await self._event_queue.put(
                             GeminiAudioDoneEvent(
                                 type="audio.done",
@@ -1031,7 +1187,7 @@ class GeminiLiveProvider:
 
         audio_blob = types.Blob(
             data=audio_data,
-            mime_type=f"audio/pcm;rate={GEMINI_INPUT_SAMPLE_RATE}",
+            mime_type=f"audio/pcm;rate={self.input_sample_rate}",
         )
         await self._session.send_realtime_input(audio=audio_blob)
         logger.debug(f"Sent {len(audio_data)} bytes of audio")
@@ -1198,6 +1354,49 @@ class GeminiLiveProvider:
 
         return result
 
+    @staticmethod
+    def _parse_usage_metadata(usage_metadata: Any) -> GeminiUsageEvent:
+        """Convert LiveServerMessage.usage_metadata into a GeminiUsageEvent.
+
+        ModalityTokenCount entries become plain dicts so the event stays
+        serializable and SDK-independent.
+        """
+
+        def _details_to_dicts(details: Any) -> Optional[list]:
+            if not details:
+                return None
+            entries = []
+            for entry in details:
+                modality = getattr(entry, "modality", None)
+                entries.append(
+                    {
+                        "modality": (
+                            getattr(modality, "name", None) or str(modality)
+                            if modality is not None
+                            else None
+                        ),
+                        "token_count": getattr(entry, "token_count", None),
+                    }
+                )
+            return entries
+
+        return GeminiUsageEvent(
+            type="usage",
+            prompt_token_count=getattr(usage_metadata, "prompt_token_count", None),
+            response_token_count=getattr(usage_metadata, "response_token_count", None),
+            cached_content_token_count=getattr(
+                usage_metadata, "cached_content_token_count", None
+            ),
+            thoughts_token_count=getattr(usage_metadata, "thoughts_token_count", None),
+            total_token_count=getattr(usage_metadata, "total_token_count", None),
+            prompt_tokens_details=_details_to_dicts(
+                getattr(usage_metadata, "prompt_tokens_details", None)
+            ),
+            response_tokens_details=_details_to_dicts(
+                getattr(usage_metadata, "response_tokens_details", None)
+            ),
+        )
+
     def _parse_response(self, response: Any) -> List[BaseGeminiEvent]:
         """Parse a Gemini LiveServerMessage into typed events.
 
@@ -1311,10 +1510,18 @@ class GeminiLiveProvider:
             server_content = response.server_content
             if hasattr(server_content, "interrupted") and server_content.interrupted:
                 events.append(GeminiInterruptionEvent(type="interruption"))
-            if (
-                hasattr(server_content, "turn_complete")
-                and server_content.turn_complete
+            interaction_status = getattr(server_content, "interaction_status", None)
+            status = getattr(interaction_status, "value", interaction_status)
+            if self._uses_extended_thinking(self.model) and status not in (
+                None,
+                "INTERACTION_STATUS_UNSPECIFIED",
             ):
+                interaction_complete = status == "IDLE"
+            else:
+                interaction_complete = bool(
+                    getattr(server_content, "turn_complete", False)
+                )
+            if interaction_complete:
                 events.append(GeminiTurnCompleteEvent(type="turn.complete"))
             # Check for output transcription (what Gemini said)
             if (
@@ -1343,8 +1550,23 @@ class GeminiLiveProvider:
                             transcript=transcription.text,
                         )
                     )
+        # Check for usage metadata (token counts for billing)
+        usage_metadata = getattr(response, "usage_metadata", None)
+        if usage_metadata is not None:
+            events.append(self._parse_usage_metadata(usage_metadata))
+
         # If no events were extracted, return unknown event with debug info
         if not events:
+            server_content = getattr(response, "server_content", None)
+            if (
+                self._uses_extended_thinking(self.model)
+                and server_content
+                and (
+                    getattr(server_content, "turn_complete", False)
+                    or getattr(server_content, "interaction_status", None) is not None
+                )
+            ):
+                return events
             response_type = type(response).__name__
             logger.debug(f"Unknown Gemini response type: {response_type}")
             events.append(

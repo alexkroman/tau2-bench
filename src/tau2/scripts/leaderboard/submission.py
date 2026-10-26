@@ -409,8 +409,11 @@ class Submission(BaseModelNoExtra):
     submission_date: date = Field(..., description="Date of submission")
     submission_type: Literal["standard", "custom"] = Field(
         "standard",
-        description="Type of submission: 'standard' uses the default tau2-bench scaffold, "
-        "'custom' uses modified scaffolds (multi-model routers, additional tools, custom prompting, etc.)",
+        description="Type of submission: 'standard' uses the default benchmark-side "
+        "tau2-bench or tau-voice evaluation setup; 'custom' modifies benchmark-side "
+        "prompts, tools, orchestration, user simulation, tasks, or evaluation. Internal "
+        "implementation behind one compatible agent interface does not alone make a "
+        "submission custom.",
     )
     modality: Literal["text", "voice"] = Field(
         "text",
@@ -510,6 +513,16 @@ class LeaderboardManifest(BaseModelNoExtra):
     legacy_submissions: list[str] = Field(
         default_factory=list,
         description="List of legacy submission folder names (previous benchmark versions)",
+    )
+    voice_v2_submissions: list[str] = Field(
+        default_factory=list,
+        description="2.0 voice-v2 package folder names (benchmark-submission.json, "
+        "benchmark-diagnostics.json, benchmark-metadata.json)",
+    )
+    voice_v2_domain_submissions: list[str] = Field(
+        default_factory=list,
+        description="2.0 voice-v2-banking and voice-v2-entity package folder names; "
+        "each fills its domain on the same agent's voice-v2 row",
     )
     last_updated: Optional[str] = Field(
         None, description="ISO timestamp of last update"

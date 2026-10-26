@@ -45,9 +45,10 @@ from typing import TYPE_CHECKING, List, Literal, Optional, Tuple, Union
 from loguru import logger
 
 if TYPE_CHECKING:
+    from tau2.data_model.cascaded import CascadedConfig
     from tau2.voice.audio_native.aai.provider import AAIVADConfig
+    from tau2.voice.audio_native.avartha_pipecat.config import AvarthaPipecatConfig
     from tau2.voice.audio_native.gemini.provider import GeminiVADConfig
-    from tau2.voice.audio_native.livekit.config import CascadedConfig
     from tau2.voice.audio_native.nova.provider import NovaVADConfig
     from tau2.voice.audio_native.openai.provider import OpenAIVADConfig
     from tau2.voice.audio_native.qwen.provider import QwenVADConfig
@@ -55,7 +56,7 @@ if TYPE_CHECKING:
 
 from pydantic import ConfigDict, Field
 
-from tau2.agent.base.streaming import StreamingState, _has_meaningful_content
+from tau2.agent.base.streaming import StreamingState
 from tau2.agent.base_agent import FullDuplexAgent, ValidAgentInputMessage
 from tau2.config import (
     AUDIO_NATIVE_PROVIDER_TYPES,
@@ -65,6 +66,7 @@ from tau2.config import (
     DEFAULT_SEND_AUDIO_INSTANT,
 )
 from tau2.data_model.audio import TELEPHONY_AUDIO_FORMAT, AudioEncoding, AudioFormat
+from tau2.data_model.live_config import LiveConfig
 from tau2.data_model.message import (
     AssistantMessage,
     EnvironmentMessage,
@@ -75,13 +77,27 @@ from tau2.data_model.message import (
     ToolMessage,
     UserMessage,
 )
+from tau2.data_model.usage import UsageRecord
 from tau2.environment.tool import Tool
+from tau2.utils.transcript.linearization import has_meaningful_content
 from tau2.utils.utils import get_now
 from tau2.voice.audio_native.adapter import DiscreteTimeAdapter, create_adapter
 from tau2.voice.audio_native.tick_result import TickResult
+from tau2.voice.pricing import compute_tick_cost
 
 # Provider type alias
-AudioNativeProvider = Literal["openai", "gemini", "xai", "nova", "qwen", "aai", "livekit"]
+AudioNativeProvider = Literal[
+    "openai",
+    "openai_live",
+    "gemini",
+    "xai",
+    "nova",
+    "qwen",
+    "aai",
+    "avartha_pipecat",
+    "phonic",
+    "livekit",
+]
 
 # VAD config union type (string annotations for lazy resolution)
 VADConfig = Union[
@@ -94,41 +110,29 @@ VADConfig = Union[
 ]
 
 AUDIO_NATIVE_VOICE_INSTRUCTION = """
-You are a customer service agent handling a VOICE CALL with a customer.
+You are a customer service agent handling a voice call with a customer.
 
-# Important Voice Call Considerations
+# Voice Call Instructions
 
-1. Respond naturally and conversationally as you would in a real phone call
-
-2. Try to be helpful and always follow the policy.
-
-# User authentication and user information collection
-
-1. When collecting customer information (e.g. names, emails, IDs), ask the customer to spell it out letter by letter (e.g. "J, O, H, N") to ensure you have the correct information and accomodate for customer audio being unclear or background noise.
-
-2. If authenticating the user fails based on user provided information, ALWAYS explicitly ask the customer to SPELL THINGS OUT or provide information LETTER BY LETTER (e.g. "first name J, O, H, N last name S, M, I, T, H").
+1. First, authenticate the customer according to the domain policy.
+2. Respond naturally and conversationally.
+3. Be helpful and follow the domain policy.
 """.strip()
 
-CASCADED_MODEL_INSTRUCTION = """
-You are a customer service agent handling a VOICE CALL with a customer.
+CASCADED_MODEL_INSTRUCTION = (
+    AUDIO_NATIVE_VOICE_INSTRUCTION
+    + """
 
-# Important Voice Call Considerations
+# Transcribed Speech
 
-1. For the conversation, you will see transcribed speech, not written text. Expect:
+For the conversation, you will see transcribed speech, not written text. Expect:
 - Misspellings of names, emails, or technical terms
 - Missing or incorrect punctuation (periods, commas)
 - Run-on sentences or incomplete thoughts
 
-2. Respond naturally and conversationally as you would in a real phone call. Do not use bullets (numbered or unnumbered) or markdown formatting.
-
-3. Try to be helpful and always follow the policy.
-
-# User authentication and user information collection
-
-1. When collecting customer information (e.g. names, emails, IDs), ask the customer to spell it out letter by letter (e.g. "J, O, H, N") to ensure you have the correct information and accomodate for customer audio being unclear or background noise.
-
-2. If authenticating the user fails based on user provided information, ALWAYS explicitly ask the customer to SPELL THINGS OUT or provide information LETTER BY LETTER (e.g. "first name J, O, H, N last name S, M, I, T, H").
-""".strip()
+Do not use bullets (numbered or unnumbered) or markdown formatting.
+"""
+)
 
 # System prompt without XML tags (for xAI and other providers that prefer plain text)
 AUDIO_NATIVE_SYSTEM_PROMPT_PLAIN = """
@@ -177,6 +181,38 @@ class DiscreteTimeAgentState(StreamingState[ValidAgentInputMessage, AssistantMes
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
 
+def build_audio_native_system_prompt(
+    domain_policy: str,
+    *,
+    provider: AudioNativeProvider,
+    use_xml_prompt: bool = False,
+    agent_instruction_override: Optional[str] = None,
+) -> str:
+    """Assemble the agent prompt without constructing an agent or provider."""
+    # Use plain text by default (use_xml_prompt=False), or XML if explicitly set to True
+    template = (
+        AUDIO_NATIVE_SYSTEM_PROMPT_XML
+        if use_xml_prompt
+        else AUDIO_NATIVE_SYSTEM_PROMPT_PLAIN
+    )
+
+    # Use CASCADED_MODEL_INSTRUCTION for cascaded models (e.g., livekit)
+    # which work with transcribed speech rather than native audio
+    provider_type = AUDIO_NATIVE_PROVIDER_TYPES.get(provider, "audio_native")
+    if provider_type == "cascaded":
+        agent_instruction = CASCADED_MODEL_INSTRUCTION
+    else:
+        agent_instruction = AUDIO_NATIVE_VOICE_INSTRUCTION
+
+    if agent_instruction_override is not None:
+        agent_instruction = agent_instruction_override
+
+    return template.format(
+        agent_instruction=agent_instruction,
+        domain_policy=domain_policy,
+    )
+
+
 class DiscreteTimeAudioNativeAgent(FullDuplexAgent[DiscreteTimeAgentState]):
     """Audio native agent with discrete-time tick semantics.
 
@@ -213,12 +249,20 @@ class DiscreteTimeAudioNativeAgent(FullDuplexAgent[DiscreteTimeAgentState]):
         use_xml_prompt: bool = False,
         cascaded_config: Optional["CascadedConfig"] = None,
         audio_taps_dir: Optional[Path] = None,
+        live_config: Optional[LiveConfig] = None,
+        voice: Optional[str] = None,
+        transcription_language: Optional[str] = None,
+        language: Optional[str] = None,
+        agent_instruction_override: Optional[str] = None,
+        additional_stop_tool_names: frozenset[str] = frozenset(),
+        avartha_config: Optional["AvarthaPipecatConfig"] = None,
     ):
         """Initialize the discrete-time audio native agent.
 
         Args:
             tools: List of tools the agent can use.
             domain_policy: Domain policy (system prompt content).
+            language: Resolved run language for supported provider session hints.
             tick_duration_ms: Duration of each tick in milliseconds.
             modality: "audio" or "audio_in_text_out".
             adapter: Optional adapter instance. Created if not provided.
@@ -244,6 +288,8 @@ class DiscreteTimeAudioNativeAgent(FullDuplexAgent[DiscreteTimeAgentState]):
                 Only used when provider="livekit". Ignored for other providers.
                 Can be a CascadedConfig instance or None to use defaults.
             audio_taps_dir: Directory to save audio taps. Only used when audio_taps_dir is not None.
+            avartha_config: Connection settings for a hosted Avartha agent. Only
+                used when provider="avartha_pipecat".
         """
         self.tools = tools
         self.domain_policy = domain_policy
@@ -256,6 +302,16 @@ class DiscreteTimeAudioNativeAgent(FullDuplexAgent[DiscreteTimeAgentState]):
         self.reasoning_effort = reasoning_effort
         self.max_inactive_seconds = max_inactive_seconds
         self.cascaded_config = cascaded_config
+        self.live_config = live_config
+        self.voice = voice
+        self.transcription_language = transcription_language
+        self.language = language
+        self.agent_instruction_override = agent_instruction_override
+        self.additional_stop_tool_names = additional_stop_tool_names
+        self.avartha_config = avartha_config
+        self._live_trace_path = (
+            audio_taps_dir / "live.jsonl" if audio_taps_dir else None
+        )
 
         # Audio format (defaults to telephony)
         self.audio_format = audio_format or TELEPHONY_AUDIO_FORMAT
@@ -268,7 +324,7 @@ class DiscreteTimeAudioNativeAgent(FullDuplexAgent[DiscreteTimeAgentState]):
         # pulling in websockets/aiohttp when voice extras aren't installed)
         if vad_config is not None:
             self.vad_config = vad_config
-        elif provider == "openai":
+        elif provider in {"openai", "openai_live"}:
             from tau2.voice.audio_native.openai.provider import (
                 OpenAIVADConfig,
                 OpenAIVADMode,
@@ -294,6 +350,12 @@ class DiscreteTimeAudioNativeAgent(FullDuplexAgent[DiscreteTimeAgentState]):
             from tau2.voice.audio_native.aai.provider import AAIVADConfig
 
             self.vad_config = AAIVADConfig()
+        elif provider == "avartha_pipecat":
+            # Turn detection is configured on the hosted agent.
+            self.vad_config = None
+        elif provider == "phonic":
+            # Phonic does its own turn detection.
+            self.vad_config = None
         elif provider == "livekit":
             from tau2.voice.audio_native.livekit.discrete_time_adapter import (
                 LiveKitVADConfig,
@@ -336,29 +398,12 @@ class DiscreteTimeAudioNativeAgent(FullDuplexAgent[DiscreteTimeAgentState]):
             logger.info(f"Agent audio taps enabled, output dir: {audio_taps_dir}")
 
     def _build_system_prompt(self) -> str:
-        """Build the system prompt from domain policy with voice instructions.
-
-        Uses plain text format by default for all providers.
-        Can be overridden via use_xml_prompt parameter.
-        """
-        # Use plain text by default (use_xml_prompt=False), or XML if explicitly set to True
-        template = (
-            AUDIO_NATIVE_SYSTEM_PROMPT_XML
-            if self.use_xml_prompt
-            else AUDIO_NATIVE_SYSTEM_PROMPT_PLAIN
-        )
-
-        # Use CASCADED_MODEL_INSTRUCTION for cascaded models (e.g., livekit)
-        # which work with transcribed speech rather than native audio
-        provider_type = AUDIO_NATIVE_PROVIDER_TYPES.get(self.provider, "audio_native")
-        if provider_type == "cascaded":
-            agent_instruction = CASCADED_MODEL_INSTRUCTION
-        else:
-            agent_instruction = AUDIO_NATIVE_VOICE_INSTRUCTION
-
-        return template.format(
-            agent_instruction=agent_instruction,
-            domain_policy=self.domain_policy,
+        """Build the same prompt used by offline review."""
+        return build_audio_native_system_prompt(
+            self.domain_policy,
+            provider=self.provider,
+            use_xml_prompt=self.use_xml_prompt,
+            agent_instruction_override=self.agent_instruction_override,
         )
 
     @property
@@ -373,6 +418,12 @@ class DiscreteTimeAudioNativeAgent(FullDuplexAgent[DiscreteTimeAgentState]):
                 reasoning_effort=self.reasoning_effort,
                 audio_format=self.audio_format,
                 cascaded_config=self.cascaded_config,
+                live_config=self.live_config,
+                trace_path=self._live_trace_path,
+                voice=self.voice,
+                transcription_language=self.transcription_language,
+                language=self.language,
+                avartha_config=self.avartha_config,
             )
         return self._adapter
 
@@ -520,7 +571,7 @@ class DiscreteTimeAudioNativeAgent(FullDuplexAgent[DiscreteTimeAgentState]):
         state.record_tick(
             tick_id=state.tick_count,
             timestamp=get_now(),
-            self_chunk=response if _has_meaningful_content(response) else None,
+            self_chunk=response if has_meaningful_content(response) else None,
             other_chunk=(
                 participant_chunk if self.speech_detection(participant_chunk) else None
             ),
@@ -528,7 +579,7 @@ class DiscreteTimeAudioNativeAgent(FullDuplexAgent[DiscreteTimeAgentState]):
         )
 
         # Append to message history
-        if response.is_tool_call() or _has_meaningful_content(response):
+        if response.is_tool_call() or has_meaningful_content(response):
             state.messages.append(response)
 
         return response, state
@@ -636,10 +687,27 @@ class DiscreteTimeAudioNativeAgent(FullDuplexAgent[DiscreteTimeAgentState]):
         audio_format = self.audio_format
 
         # Check if there was actual speech (not just silence padding)
-        has_speech = len(tick_result.agent_audio_data) > 0
+        has_speech = (
+            tick_result.contains_speech
+            if tick_result.contains_speech is not None
+            else len(tick_result.agent_audio_data) > 0
+        )
 
         audio_content = base64.b64encode(agent_audio).decode("utf-8")
         content = transcript if transcript else None
+
+        # Per-message cost: priced from this tick's delta usage records (most
+        # ticks report none and cost 0.0). Cumulative meters (Nova, xAI audio
+        # minutes, STT) are priced once at session level, not per message, so
+        # SimulationRun.agent_cost — derived from the session usage ledger —
+        # is the authoritative total.
+        usage_records = tick_result.usage_records
+        cost = compute_tick_cost(usage_records) if usage_records else 0.0
+        usage = (
+            {"records": [r.model_dump(exclude_none=True) for r in usage_records]}
+            if usage_records
+            else None
+        )
 
         message = AssistantMessage(
             role="assistant",
@@ -652,6 +720,8 @@ class DiscreteTimeAudioNativeAgent(FullDuplexAgent[DiscreteTimeAgentState]):
             contains_speech=has_speech,
             raw_data=tick_result.model_dump(serialize_as_any=True),
             utterance_ids=tick_result.item_ids if tick_result.item_ids else None,
+            cost=cost,
+            usage=usage,
         )
         # Check if this is a stop message (done or transfer tool call)
         message = self._check_if_stop_toolcall(message)
@@ -679,10 +749,21 @@ class DiscreteTimeAudioNativeAgent(FullDuplexAgent[DiscreteTimeAgentState]):
             chunk_id=0,
             is_final_chunk=True,
             contains_speech=False,
+            cost=0.0,
         )
         # check if the message should be considered a stop message.
         message = self._check_if_stop_toolcall(message)
         return message
+
+    def get_usage_records(self) -> List[UsageRecord]:
+        """Provider usage records collected by the adapter.
+
+        Safe to call after stop()/cleanup(): the adapter's usage ledger
+        survives disconnect. Returns [] if no adapter was ever created.
+        """
+        if self._adapter is None:
+            return []
+        return self._adapter.get_usage_records()
 
     def create_initial_message(
         self, content: str = "Hi! How can I help you today?"
@@ -773,7 +854,10 @@ class DiscreteTimeAudioNativeAgent(FullDuplexAgent[DiscreteTimeAgentState]):
         is_stop = False
         if message.tool_calls:
             for tool_call in message.tool_calls:
-                if tool_call.name == self.STOP_FUNCTION_NAME:
+                if (
+                    tool_call.name == self.STOP_FUNCTION_NAME
+                    or tool_call.name in self.additional_stop_tool_names
+                ):
                     is_stop = True
                     break
         if is_stop:
@@ -810,7 +894,20 @@ def create_discrete_time_audio_native_agent(tools, domain_policy, **kwargs):
     """
     audio_native_config = kwargs.get("audio_native_config")
     audio_taps_dir = kwargs.get("audio_taps_dir")
+    domain_kwargs = {
+        "agent_instruction_override": kwargs.get("agent_instruction_override"),
+        "additional_stop_tool_names": kwargs.get(
+            "additional_stop_tool_names", frozenset()
+        ),
+    }
     if audio_native_config is not None:
+        cascaded_config = audio_native_config.cascaded_config
+        if audio_native_config.provider == "livekit" and cascaded_config is None:
+            from tau2.data_model.cascaded import CascadedConfigRequest
+
+            cascaded_config = (
+                audio_native_config.cascaded_request or CascadedConfigRequest()
+            ).resolve(audio_native_config.language)
         return DiscreteTimeAudioNativeAgent(
             tools=tools,
             domain_policy=domain_policy,
@@ -821,8 +918,14 @@ def create_discrete_time_audio_native_agent(tools, domain_policy, **kwargs):
             model=audio_native_config.model,
             reasoning_effort=audio_native_config.reasoning_effort,
             use_xml_prompt=audio_native_config.use_xml_prompt,
-            cascaded_config=getattr(audio_native_config, "cascaded_config", None),
+            cascaded_config=cascaded_config,
             audio_taps_dir=audio_taps_dir,
+            **domain_kwargs,
+            live_config=audio_native_config.live_config,
+            voice=audio_native_config.voice,
+            transcription_language=audio_native_config.transcription_language,
+            language=audio_native_config.language,
+            avartha_config=audio_native_config.avartha_config,
         )
     else:
         # Fallback: use individual kwargs or defaults
@@ -833,5 +936,7 @@ def create_discrete_time_audio_native_agent(tools, domain_policy, **kwargs):
             modality=kwargs.get("modality", "audio"),
             provider=kwargs.get("provider", DEFAULT_AUDIO_NATIVE_PROVIDER),
             model=kwargs.get("model"),
+            language=kwargs.get("language"),
             audio_taps_dir=audio_taps_dir,
+            **domain_kwargs,
         )
