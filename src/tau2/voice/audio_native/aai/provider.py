@@ -28,6 +28,7 @@ from tau2.config import (
     DEFAULT_AAI_MODEL,
     DEFAULT_AAI_WS_URL,
 )
+from tau2.environment.toolkit import TOOL_TYPE_ATTR, ToolType
 from tau2.utils.retry import websocket_retry
 from tau2.voice.audio_native.aai.events import (
     AAIAudioChunkEvent,
@@ -195,15 +196,33 @@ class AAIVoiceAgentProvider:
             schema = tool.openai_schema
             # Extract the nested function schema and flatten it
             func_schema = schema["function"]
-            formatted_tools.append(
-                {
-                    "type": "function",
-                    "name": func_schema["name"],
-                    "description": func_schema["description"],
-                    "parameters": func_schema["parameters"],
-                }
-            )
+            formatted = {
+                "type": "function",
+                "name": func_schema["name"],
+                "description": func_schema["description"],
+                "parameters": func_schema["parameters"],
+            }
+            annotations = self._tool_annotations(tool)
+            if annotations:
+                formatted["annotations"] = annotations
+            formatted_tools.append(formatted)
         return formatted_tools
+
+    @staticmethod
+    def _tool_annotations(tool) -> Dict:
+        """MCP-style hints from the tool's declared type, never sent to the model.
+
+        READ -> ``readOnlyHint: true``, WRITE -> ``readOnlyHint: false``; other
+        types (THINK, GENERIC) send nothing. The host uses ``false`` to run a
+        write only on a caller turn that did not start over the agent's audio,
+        so an "uh-huh" spoken over its question cannot confirm the action.
+        """
+        tool_type = getattr(getattr(tool, "_func", None), TOOL_TYPE_ATTR, None)
+        if tool_type == ToolType.READ:
+            return {"readOnlyHint": True}
+        if tool_type == ToolType.WRITE:
+            return {"readOnlyHint": False}
+        return {}
 
     def _build_config_message(self, system_prompt: str, tools: tuple) -> Dict:
         """Build the configuration message for the AAI host.

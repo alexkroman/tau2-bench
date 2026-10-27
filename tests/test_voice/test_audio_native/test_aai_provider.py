@@ -155,6 +155,28 @@ class TestAAIVoiceAgentProvider:
         assert tool["description"] == "Test function"
         assert "function" not in tool
 
+    def test_format_tools_for_api_sends_read_write_annotations(self) -> None:
+        """READ/WRITE tools carry readOnlyHint for the host's write gate;
+        others carry no annotation."""
+        from tau2.domains.retail.environment import get_environment
+
+        tools = {t.name: t for t in get_environment().get_tools()}
+        formatted = {
+            t["name"]: t
+            for t in AAIVoiceAgentProvider()._format_tools_for_api(
+                [
+                    tools["get_order_details"],
+                    tools["return_delivered_order_items"],
+                    tools["calculate"],
+                ]
+            )
+        }
+        assert formatted["get_order_details"]["annotations"] == {"readOnlyHint": True}
+        assert formatted["return_delivered_order_items"]["annotations"] == {
+            "readOnlyHint": False
+        }
+        assert "annotations" not in formatted["calculate"]
+
     def test_with_host_flag_appends_query_param(self) -> None:
         """Test _with_host_flag appends ?host=1 to URL."""
         result = AAIVoiceAgentProvider._with_host_flag("ws://localhost:3000/websocket")
