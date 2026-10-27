@@ -22,6 +22,7 @@ from tau2.voice.audio_native.aai.events import (
     AAISpeechStartedEvent,
     AAISpeechStoppedEvent,
     AAIToolCallEvent,
+    AAIUserTranscriptEvent,
 )
 from tau2.voice.audio_native.tick_result import TickResult
 
@@ -379,3 +380,16 @@ def test_reply_end_marks_its_audio_complete() -> None:
     assert not a._utterance_transcripts[turn_id].audio_complete
     a._process_event(r, AAIReplyDoneEvent())
     assert a._utterance_transcripts[turn_id].audio_complete
+
+
+def test_the_turn_the_host_committed_is_recorded_on_the_tick() -> None:
+    """Recorded (task 12): a write tool followed a bare "Uh-huh." and only the
+    task log's debug lines showed it. The committed caller turn must survive
+    into the trajectory's raw_data, and must not pose as GPT Live evidence."""
+    a = _adapter()
+    r = _result()
+    a._process_event(r, AAIUserTranscriptEvent(text="Uh-huh."))
+
+    assert r.provider_user_transcripts == ["Uh-huh."]
+    assert r.live_transcript is None
+    assert r.model_dump()["provider_user_transcripts"] == ["Uh-huh."]

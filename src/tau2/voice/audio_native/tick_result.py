@@ -103,6 +103,13 @@ class TickResult(BaseModel):
         exclude=True,  # Exclude from serialization (may contain bytes)
     )
     live_transcript: LiveTranscriptTick | None = None
+    # What the provider COMMITTED as the caller's turn this tick — the text its
+    # model was handed. Diagnostic only; kept apart from `live_transcript`,
+    # whose presence switches judges and views onto GPT Live's grouping.
+    provider_user_transcripts: List[str] = Field(
+        default_factory=list,
+        description="Caller turns the provider committed this tick, verbatim",
+    )
 
     # --- VAD events (provider-agnostic) ---
     # Normalized VAD event types detected this tick:

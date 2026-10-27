@@ -45,6 +45,7 @@ from tau2.voice.audio_native.aai.events import (
     AAISpeechStoppedEvent,
     AAITimeoutEvent,
     AAIToolCallEvent,
+    AAIUserTranscriptEvent,
 )
 from tau2.voice.audio_native.aai.provider import AAIVoiceAgentProvider
 from tau2.voice.audio_native.aai.transcript_pacing import PacedUtteranceTranscript
@@ -417,6 +418,12 @@ class DiscreteTimeAAIAdapter(DiscreteTimeAdapter):
 
         elif isinstance(event, AAISpeechStoppedEvent):
             result.vad_events.append("speech_stopped")
+
+        elif isinstance(event, AAIUserTranscriptEvent):
+            # The turn the host's model was handed. Without it a trajectory
+            # cannot show that a write tool followed a bare "Uh-huh." — only
+            # the task log's debug lines could.
+            result.provider_user_transcripts.append(event.text)
 
         elif isinstance(event, AAIReplyDoneEvent):
             item_id = self._current_item_id
