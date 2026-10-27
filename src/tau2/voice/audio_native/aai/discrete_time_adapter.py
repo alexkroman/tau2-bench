@@ -34,6 +34,7 @@ from tau2.data_model.audio import (
 from tau2.data_model.message import ToolCall
 from tau2.environment.tool import Tool
 from tau2.voice.audio_native.aai.events import (
+    AAIAgentCaptionEvent,
     AAIAgentTranscriptEvent,
     AAIAudioChunkEvent,
     AAIAudioDoneEvent,
@@ -46,9 +47,10 @@ from tau2.voice.audio_native.aai.events import (
     AAIToolCallEvent,
 )
 from tau2.voice.audio_native.aai.provider import AAIVoiceAgentProvider
+from tau2.voice.audio_native.aai.transcript_pacing import PacedUtteranceTranscript
 from tau2.voice.audio_native.adapter import DiscreteTimeAdapter
 from tau2.voice.audio_native.async_loop import BackgroundAsyncLoop
-from tau2.voice.audio_native.tick_result import TickResult, UtteranceTranscript
+from tau2.voice.audio_native.tick_result import TickResult
 from tau2.voice.utils.audio_preprocessing import (
     convert_to_pcm16,
     convert_to_ulaw,
@@ -118,6 +120,10 @@ class DiscreteTimeAAIAdapter(DiscreteTimeAdapter):
         # reply_done is expected to carry zero audio/transcript, so the
         # loud-failure guard in _process_event skips them.
         self._interrupted_turn_ids: set[str] = set()
+        # Turn ids whose text came from the live caption. Their committed
+        # transcript is NOT allowed to replace it: the commit drops the
+        # dead-air fillers the caller heard, so it no longer matches the audio.
+        self._captioned_turn_ids: set[str] = set()
 
     @property
     def provider(self) -> AAIVoiceAgentProvider:
@@ -329,13 +335,19 @@ class DiscreteTimeAAIAdapter(DiscreteTimeAdapter):
     def _process_event(self, result: TickResult, event: Any) -> None:
         result.events.append(event)
 
-        if isinstance(event, AAIAgentTranscriptEvent):
+        if isinstance(event, AAIAgentCaptionEvent):
             item_id = self._ensure_current_item_id()
-            ut = self._utterance_transcripts.setdefault(
-                item_id, UtteranceTranscript(item_id=item_id)
-            )
-            # aai sends the full transcript each time (not deltas); overwrite.
-            ut.transcript_received = event.text
+            # The caption is what the caller hears; full-replacement snapshots,
+            # so overwrite. It also arrives as text reaches TTS rather than at
+            # the end of the reply, which is what lets the caller read along.
+            self._utterance_transcript(item_id).transcript_received = event.text
+            self._captioned_turn_ids.add(item_id)
+
+        elif isinstance(event, AAIAgentTranscriptEvent):
+            item_id = self._ensure_current_item_id()
+            if item_id not in self._captioned_turn_ids:
+                # aai sends the full transcript each time (not deltas); overwrite.
+                self._utterance_transcript(item_id).transcript_received = event.text
 
         elif isinstance(event, AAIAudioChunkEvent):
             item_id = self._ensure_current_item_id()
@@ -347,10 +359,7 @@ class DiscreteTimeAAIAdapter(DiscreteTimeAdapter):
                 return
             if ulaw_bytes:
                 result.agent_audio_chunks.append((ulaw_bytes, item_id))
-            ut = self._utterance_transcripts.setdefault(
-                item_id, UtteranceTranscript(item_id=item_id)
-            )
-            ut.add_audio(len(ulaw_bytes))
+            self._utterance_transcript(item_id).add_audio(len(ulaw_bytes))
 
         elif isinstance(event, AAIToolCallEvent):
             result.tool_calls.append(
@@ -399,6 +408,7 @@ class DiscreteTimeAAIAdapter(DiscreteTimeAdapter):
             # normally it finished (measured: 108s of one call unheard).
             logger.debug("Reply cancelled - interruption")
             result.was_truncated = True
+            self._mark_audio_complete(self._current_item_id)
             if self._current_item_id is not None:
                 result.skip_item_id = self._current_item_id
                 self._interrupted_turn_ids.add(self._current_item_id)
@@ -410,6 +420,7 @@ class DiscreteTimeAAIAdapter(DiscreteTimeAdapter):
 
         elif isinstance(event, AAIReplyDoneEvent):
             item_id = self._current_item_id
+            self._mark_audio_complete(item_id)
             was_interrupted = item_id in self._interrupted_turn_ids
             ut = self._utterance_transcripts.get(item_id) if item_id else None
             if ut is not None and not was_interrupted:
@@ -426,6 +437,7 @@ class DiscreteTimeAAIAdapter(DiscreteTimeAdapter):
 
         elif isinstance(event, AAIAudioDoneEvent):
             logger.debug("Audio playback done")
+            self._mark_audio_complete(self._current_item_id)
 
         elif isinstance(event, AAIErrorEvent):
             logger.error(f"aai host error: {event.code} {event.message}")
@@ -435,6 +447,21 @@ class DiscreteTimeAAIAdapter(DiscreteTimeAdapter):
 
         else:
             logger.debug(f"Event {type(event).__name__} received")
+
+    def _utterance_transcript(self, item_id: str) -> PacedUtteranceTranscript:
+        """The paced transcript for ``item_id``, created on first use."""
+        return self._utterance_transcripts.setdefault(
+            item_id,
+            PacedUtteranceTranscript(
+                item_id=item_id, bytes_per_second=self.audio_format.bytes_per_second
+            ),
+        )
+
+    def _mark_audio_complete(self, item_id: Optional[str]) -> None:
+        """No more audio is coming for ``item_id``: pace against its real total."""
+        ut = self._utterance_transcripts.get(item_id) if item_id else None
+        if isinstance(ut, PacedUtteranceTranscript):
+            ut.audio_complete = True
 
     def _ensure_current_item_id(self) -> str:
         """Return the synthetic turn id for the in-progress turn, creating it

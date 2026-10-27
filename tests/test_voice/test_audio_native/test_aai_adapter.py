@@ -282,3 +282,100 @@ def test_apply_negotiated_rates_requires_a_handshake() -> None:
     a = DiscreteTimeAAIAdapter(tick_duration_ms=200)
     with pytest.raises(RuntimeError):
         a._apply_negotiated_rates()
+
+
+# --- Caller-text pacing (transcript_pacing.py) and live captions -------------
+
+
+def test_paced_text_matches_character_slicing_for_plain_letters() -> None:
+    from tau2.voice.audio_native.aai.transcript_pacing import paced_text
+    from tau2.voice.utils.transcript_utils import get_proportional_text
+
+    text = "please provide your email"
+    for played in range(0, 11):
+        assert paced_text(text, 10, played, 0) == get_proportional_text(
+            text, 10, played, 0
+        )
+
+
+def test_paced_text_spends_spoken_time_on_digits() -> None:
+    from tau2.voice.audio_native.aai.transcript_pacing import paced_text
+    from tau2.voice.utils.transcript_utils import get_proportional_text
+
+    # A reply ending in a spoken ZIP. At 70% of the audio the words are said and
+    # the digits are still to come; character slicing is still mid-"Houston".
+    text = "Your default address is now 760 Elm Avenue, Houston, Texas, 7-7-0-3-4."
+    assert paced_text(text, 100, 70, 0)[0].endswith("Texas, ")
+    assert "Texas" not in get_proportional_text(text, 100, 70, 0)[0]
+    assert paced_text(text, 100, 100, 0)[0] == text
+
+
+def test_text_ahead_of_its_audio_is_paced_against_the_spoken_estimate() -> None:
+    from tau2.voice.audio_native.aai.transcript_pacing import (
+        PacedUtteranceTranscript,
+    )
+
+    # A whole sentence known after 0.2s of audio has arrived. Against audio
+    # received so far, playing that 0.2s would reveal all of it at once.
+    ut = PacedUtteranceTranscript(item_id="t", bytes_per_second=8000)
+    ut.transcript_received = "Your order has five items, which two?"
+    ut.add_audio(1600)
+    shown = ut.get_transcript_for_audio(1600)
+    assert 0 < len(shown) < len(ut.transcript_received) / 2
+
+
+def test_audio_complete_paces_against_the_real_total() -> None:
+    from tau2.voice.audio_native.aai.transcript_pacing import (
+        PacedUtteranceTranscript,
+    )
+
+    ut = PacedUtteranceTranscript(item_id="t", bytes_per_second=8000)
+    ut.transcript_received = "Your order has five items, which two?"
+    ut.add_audio(1600)
+    ut.audio_complete = True
+    assert ut.get_transcript_for_audio(1600) == ut.transcript_received
+
+
+def test_agent_caption_is_parsed_from_the_interim_wire_event() -> None:
+    from tau2.voice.audio_native.aai.events import (
+        AAIAgentCaptionEvent,
+        parse_aai_event,
+    )
+
+    event = parse_aai_event(
+        {"type": "agentTranscript.updated", "text": "I'm checking on this."}
+    )
+    assert isinstance(event, AAIAgentCaptionEvent)
+    assert event.text == "I'm checking on this."
+
+
+def test_caption_is_what_the_caller_reads_and_survives_the_commit() -> None:
+    from tau2.voice.audio_native.aai.events import AAIAgentCaptionEvent
+
+    a = _adapter()
+    r = _result()
+    heard = "I'm checking on this. Your order has five items."
+    a._process_event(r, AAIAgentCaptionEvent(text="I'm checking on this."))
+    a._process_event(r, AAIAgentCaptionEvent(text=heard))
+    # The commit drops the filler the caller heard; it must not replace it.
+    a._process_event(r, AAIAgentTranscriptEvent(text="Your order has five items."))
+    assert a._utterance_transcripts[a._current_item_id].transcript_received == heard
+
+
+def test_commit_is_used_when_no_caption_arrived() -> None:
+    a = _adapter()
+    r = _result()
+    a._process_event(r, AAIAgentTranscriptEvent(text="Your order has five items."))
+    ut = a._utterance_transcripts[a._current_item_id]
+    assert ut.transcript_received == "Your order has five items."
+
+
+def test_reply_end_marks_its_audio_complete() -> None:
+    a = _adapter()
+    r = _result()
+    a._process_event(r, AAIAgentTranscriptEvent(text="Done."))
+    turn_id = a._current_item_id
+    a._process_event(r, AAIAudioChunkEvent(pcm16=(b"\x10\x00") * 480))
+    assert not a._utterance_transcripts[turn_id].audio_complete
+    a._process_event(r, AAIReplyDoneEvent())
+    assert a._utterance_transcripts[turn_id].audio_complete

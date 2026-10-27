@@ -73,6 +73,14 @@ class AAIAgentTranscriptEvent(BaseAAIEvent):
     text: str
 
 
+class AAIAgentCaptionEvent(BaseAAIEvent):
+    """Live caption of the reply in progress: a full-replacement snapshot of
+    everything handed to TTS so far, dead-air cover fillers included."""
+
+    type: Literal["agent_caption"] = "agent_caption"
+    text: str
+
+
 # =============================================================================
 # Tool Events
 # =============================================================================
@@ -206,6 +214,7 @@ _EVENT_TYPE_MAP: dict[str, type[BaseAAIEvent]] = {
     "speech_stopped": AAISpeechStoppedEvent,
     "user_transcript": AAIUserTranscriptEvent,
     "agent_transcript": AAIAgentTranscriptEvent,
+    "agent_caption": AAIAgentCaptionEvent,
     "tool_call": AAIToolCallEvent,
     "tool_call_done": AAIToolCallDoneEvent,
     "reply_done": AAIReplyDoneEvent,
@@ -263,6 +272,7 @@ _WIRE_ALIASES: dict[str, str] = {
     "speech.stopped": "speech_stopped",
     "userTranscript.committed": "user_transcript",
     "agentTranscript.committed": "agent_transcript",
+    "agentTranscript.updated": "agent_caption",
     "tool.called": "tool_call",
     "tool.completed": "tool_call_done",
     "reply.completed": "reply_done",
@@ -274,17 +284,15 @@ _WIRE_ALIASES: dict[str, str] = {
     "custom.emitted": "custom_event",
 }
 
-# The two INTERIM streams are dropped deliberately, and this is the one place
-# the choice is visible. `agentTranscript.updated` / `userTranscript.updated`
-# carry the partial text for the turn in progress; the flat `agent_transcript`
-# this integration was written against was the COMMITTED text, so mapping the
-# updated stream to it as well would double every agent utterance in the
-# caller-heard concatenation and move the response-latency measurement onto the
-# first partial rather than the settled sentence. They fall through to
-# AAIUnknownEvent, which the adapter ignores.
-_IGNORED_WIRE_EVENTS: frozenset[str] = frozenset(
-    {"agentTranscript.updated", "userTranscript.updated"}
-)
+# The agent's INTERIM stream gets its own name rather than `agent_transcript`:
+# `agentTranscript.updated` is the live caption — what the caller actually HEARS,
+# dead-air cover fillers ("I'm checking on this.") included — while the committed
+# text is the record, with the fillers removed. The simulated caller reads agent
+# speech as text, so the adapter feeds it the caption; mapping it to
+# `agent_transcript` instead would also move scripts/latency.py's response clock
+# onto the first partial. The user's interim stream is still dropped: it falls
+# through to AAIUnknownEvent, which the adapter ignores.
+_IGNORED_WIRE_EVENTS: frozenset[str] = frozenset({"userTranscript.updated"})
 
 
 # =============================================================================
