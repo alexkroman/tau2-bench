@@ -382,6 +382,28 @@ def test_reply_end_marks_its_audio_complete() -> None:
     assert a._utterance_transcripts[turn_id].audio_complete
 
 
+def test_a_cut_reply_reveals_nothing_past_what_was_played() -> None:
+    """Recorded (task 8): the caller read "…couldn't locate the account.
+    Please s" in the tick the audio stopped at "ZIP 2". A cut reply's received
+    audio is only the truncated part, so pacing against it as the total
+    revealed the unspoken rest at once."""
+    a = _adapter()
+    r = _result()
+    text = "I have May Kovacs, ZIP 2-8-2-3-6, but couldn't locate the account."
+    a._process_event(r, AAIAgentTranscriptEvent(text=text))
+    turn_id = a._current_item_id
+    a._process_event(r, AAIAudioChunkEvent(pcm16=(b"\x10\x00") * 1600))  # 0.2 s
+    ut = a._utterance_transcripts[turn_id]
+    before = ut.get_transcript_for_audio(800)
+    a._process_event(r, AAISpeechStartedEvent())
+    a._process_event(r, AAICancelledEvent())
+    a._process_event(_result(), AAIReplyDoneEvent())
+
+    assert not ut.audio_complete
+    after = ut.get_transcript_for_audio(800)
+    assert len(before + after) < len(text) // 2
+
+
 def test_the_turn_the_host_committed_is_recorded_on_the_tick() -> None:
     """Recorded (task 12): a write tool followed a bare "Uh-huh." and only the
     task log's debug lines showed it. The committed caller turn must survive

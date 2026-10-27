@@ -409,7 +409,6 @@ class DiscreteTimeAAIAdapter(DiscreteTimeAdapter):
             # normally it finished (measured: 108s of one call unheard).
             logger.debug("Reply cancelled - interruption")
             result.was_truncated = True
-            self._mark_audio_complete(self._current_item_id)
             if self._current_item_id is not None:
                 result.skip_item_id = self._current_item_id
                 self._interrupted_turn_ids.add(self._current_item_id)
@@ -465,8 +464,17 @@ class DiscreteTimeAAIAdapter(DiscreteTimeAdapter):
         )
 
     def _mark_audio_complete(self, item_id: Optional[str]) -> None:
-        """No more audio is coming for ``item_id``: pace against its real total."""
-        ut = self._utterance_transcripts.get(item_id) if item_id else None
+        """No more audio is coming for ``item_id``: pace against its real total.
+
+        Never for a CUT reply. Its received audio is the truncated part, not the
+        utterance, so pacing against it reveals the unspoken rest of the text at
+        once — the caller read "…couldn't locate the account. Please s" in the
+        tick the audio stopped at "ZIP 2". A cut reply keeps the estimate for
+        its whole text, which reveals nothing past what was played.
+        """
+        if item_id is None or item_id in self._interrupted_turn_ids:
+            return
+        ut = self._utterance_transcripts.get(item_id)
         if isinstance(ut, PacedUtteranceTranscript):
             ut.audio_complete = True
 
