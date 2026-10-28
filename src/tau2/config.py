@@ -1,35 +1,81 @@
+import os
+
 # =============================================================================
 # SIMULATION DEFAULTS (overridable via CLI)
 # =============================================================================
 DEFAULT_MAX_STEPS = 200
 DEFAULT_MAX_ERRORS = 10
 DEFAULT_SEED = 300
+DEFAULT_TASK_SUBSET_SIZE = 50
+DEFAULT_TASK_SUBSET_SEED = 42
 DEFAULT_MAX_CONCURRENCY = 3
+DEFAULT_JUDGE_PROCESSES = 1
+DEFAULT_JUDGE_CONCURRENCY = 1
 DEFAULT_NUM_TRIALS = 1
 DEFAULT_SAVE_TO = None
 DEFAULT_LOG_LEVEL = "ERROR"
+DEFAULT_LOCALIZE_DB = True
+# Scenarios, policies and simulator guidelines are authored in this language.
+SCENARIO_LANGUAGE = "en"
+# Every run resolves a language pack; without --language it is canonical English.
+DEFAULT_LANGUAGE = "en"
 
 # =============================================================================
 # LLM DEFAULTS (overridable via CLI)
 # =============================================================================
 DEFAULT_AGENT_IMPLEMENTATION = "llm_agent"
 DEFAULT_USER_IMPLEMENTATION = "user_simulator"
-DEFAULT_LLM_AGENT = "gpt-4.1-2025-04-14"
-DEFAULT_LLM_USER = "gpt-4.1-2025-04-14"
+# When the AssemblyAI gateway is routing (TAU2_LLM_GATEWAY=assemblyai), the
+# model DEFAULTS have to be ids that gateway serves. It carries `gpt-4.1`, not
+# the dated `gpt-4.1-2025-04-14`, so tau2's own defaults answer
+# `400 invalid request body` on every call — which is what the routing helper
+# in `utils/llm_utils.py` deliberately does NOT paper over per call, because a
+# silent name rewrite changes which model a run measured while reporting the
+# name the caller asked for.
+#
+# Switching the DEFAULT is a different act: it is one visible decision taken by
+# enabling the gateway, in one place, rather than a rewrite hidden inside every
+# request. An explicit `--user-llm`/`--agent-llm` still wins.
+_GATEWAY = os.getenv("TAU2_LLM_GATEWAY", "").strip().lower() == "assemblyai"
+_DEFAULT_OPENAI_MODEL = "gpt-4.1" if _GATEWAY else "gpt-4.1-2025-04-14"
+
+DEFAULT_LLM_AGENT = _DEFAULT_OPENAI_MODEL
+DEFAULT_LLM_USER = _DEFAULT_OPENAI_MODEL
 DEFAULT_LLM_TEMPERATURE_AGENT = 0.0
 DEFAULT_LLM_TEMPERATURE_USER = 0.0
 DEFAULT_LLM_ARGS_AGENT = {"temperature": DEFAULT_LLM_TEMPERATURE_AGENT}
 DEFAULT_LLM_ARGS_USER = {"temperature": DEFAULT_LLM_TEMPERATURE_USER}
 
-DEFAULT_LLM_NL_ASSERTIONS = "gpt-4.1-2025-04-14"
-DEFAULT_LLM_NL_ASSERTIONS_TEMPERATURE = 0.0
-DEFAULT_LLM_NL_ASSERTIONS_ARGS = {"temperature": DEFAULT_LLM_NL_ASSERTIONS_TEMPERATURE}
+# English elicitation defaults. Other domains retain the defaults above.
+ELICITATION_DOMAINS = frozenset({"intake"})
+# Retrieval config for banking_knowledge runs that do not choose one; the
+# released banking benchmark requires it.
+DEFAULT_BANKING_RETRIEVAL_CONFIG = "alltools"
+DEFAULT_ELICITATION_STRATEGY = "agent_directed"
+DEFAULT_ELICITATION_COMPLICATION_RATE = 1.0
+DEFAULT_ELICITATION_MAX_STEPS_SECONDS = 240
+DEFAULT_ELICITATION_LLM_USER = "gpt-5.5"
+DEFAULT_ELICITATION_LLM_ARGS_USER = {"temperature": 0.0, "reasoning_effort": "low"}
+DEFAULT_INTAKE_TASK_SEED = 20260824
 
-DEFAULT_LLM_ENV_INTERFACE = "gpt-4.1-2025-04-14"
+DEFAULT_LLM_NL_ASSERTIONS = "gpt-5.4-mini-2026-03-17"
+DEFAULT_LLM_NL_ASSERTIONS_ARGS = {"reasoning_effort": "low"}
+
+DEFAULT_LLM_ENV_INTERFACE = _DEFAULT_OPENAI_MODEL
 DEFAULT_LLM_ENV_INTERFACE_TEMPERATURE = 0.0
 DEFAULT_LLM_ENV_INTERFACE_ARGS = {"temperature": DEFAULT_LLM_ENV_INTERFACE_TEMPERATURE}
 
-DEFAULT_LLM_EVAL_USER_SIMULATOR = "claude-opus-4-5"
+# Semantic communication scoring for every run; independent of the customer model.
+DEFAULT_SEMANTIC_COMMUNICATE_MODEL = "gpt-5.5"
+DEFAULT_SEMANTIC_COMMUNICATE_MODEL_ARGS = {"reasoning_effort": "low"}
+
+# Same rule as `_DEFAULT_OPENAI_MODEL` above: the gateway carries
+# `claude-opus-4-5-20251101`, dated, where tau2's default names the undated
+# alias. This one is the LLM JUDGE, so getting it wrong is quieter than a
+# broken turn — the run completes and only the review is missing.
+DEFAULT_LLM_EVAL_USER_SIMULATOR = (
+    "claude-opus-4-5-20251101" if _GATEWAY else "claude-opus-4-5"
+)
 
 # LLM debug logging
 DEFAULT_LLM_LOG_MODE = "latest"  # Options: "all", "latest"
@@ -78,6 +124,22 @@ DEFAULT_VOICE_SYNTHESIS_PROVIDER = "elevenlabs"
 DEFAULT_VOICE_TRANSCRIPTION_MODEL = "nova-3"
 DEFAULT_VOICE_MODEL = "eleven_v3"
 
+# Ceiling on TTS calls in flight at once, PROCESS-WIDE (see
+# tau2.voice.synthesis.synthesize). TTS providers cap concurrency per
+# subscription and answer 429 `concurrent_limit_exceeded` over it; ElevenLabs'
+# lower tiers allow 5. Exceeding it is not merely slower — a synthesis that
+# burns its retries is a caller utterance that arrives late or not at all, and
+# `--max-concurrency` does not bound this on its own, because a single
+# simulation fans out (OutOfTurnSpeechGenerator pre-generates its inserts in a
+# thread pool).
+#
+# Default 4, one below the common cap, leaving room for an in-flight retry.
+# This is PER PROCESS: running K benchmarks in parallel against one key allows
+# K x this, so set TAU2_TTS_MAX_CONCURRENCY to floor(cap / K) for those runs
+# (the env override is read in tau2.voice.synthesis.synthesize; this module is
+# deliberately import-free).
+DEFAULT_TTS_MAX_CONCURRENCY = 4
+
 # Text streaming (legacy)
 DEFAULT_TEXT_STREAMING_CHUNK_BY = "words"
 DEFAULT_TEXT_STREAMING_CHUNK_SIZE = 1
@@ -89,9 +151,12 @@ DEFAULT_TEXT_STREAMING_CONFIG = {
 # =============================================================================
 # VOICE USER SIMULATOR (fixed versioning + overridable model)
 # =============================================================================
-VOICE_USER_SIMULATOR_VERSION = "v1.0"  # fixed, bump on changes
-VOICE_USER_SIMULATOR_DECISION_MODEL = "gpt-4.1"  # overridable
+VOICE_USER_SIMULATOR_VERSION = "v1.1"  # fixed, bump on changes
+VOICE_USER_SIMULATOR_DECISION_MODEL = "gpt-5.4-mini-2026-03-17"  # overridable
+VOICE_USER_SIMULATOR_DECISION_MODEL_ARGS = {"reasoning_effort": "low"}
 DEFAULT_SPEECH_COMPLEXITY = "regular"  # overridable: "control", "regular"
+DEFAULT_CHANNEL_EFFECTS_MODE = "regular"
+DEFAULT_SPEECH_EFFECTS_MODE = "regular"
 
 # =============================================================================
 # FULL-DUPLEX VOICE DEFAULTS (overridable via CLI)
@@ -99,7 +164,8 @@ DEFAULT_SPEECH_COMPLEXITY = "regular"  # overridable: "control", "regular"
 DEFAULT_AUDIO_NATIVE_AGENT_IMPLEMENTATION = "discrete_time_audio_native_agent"
 DEFAULT_AUDIO_NATIVE_USER_IMPLEMENTATION = "voice_streaming_user_simulator"
 DEFAULT_AUDIO_NATIVE_PROVIDER = (
-    "openai"  # overridable: openai, gemini, xai, nova, qwen, livekit
+    "openai"  # overridable: openai, openai_live, gemini, xai, nova, qwen,
+    # avartha_pipecat, livekit
 )
 DEFAULT_TICK_DURATION_SECONDS = 0.20  # overridable
 DEFAULT_MAX_STEPS_SECONDS = 1200  # overridable
@@ -136,6 +202,7 @@ DEFAULT_AUDIO_NATIVE_MAX_INACTIVE_SECONDS = 40.0  # fixed, stall detection
 # OPENAI PROVIDER (overridable model/voice, fixed API constants)
 # =============================================================================
 DEFAULT_OPENAI_REALTIME_MODEL = "gpt-realtime-1.5"  # overridable
+DEFAULT_OPENAI_LIVE_MODEL = "gpt-live-1"  # overridable
 _LEGACY_OPENAI_REALTIME_MODEL = "gpt-realtime-2025-08-28"
 DEFAULT_OPENAI_REALTIME_BASE_URL = "wss://api.openai.com/v1/realtime"  # fixed
 DEFAULT_OPENAI_VOICE = "alloy"  # overridable
@@ -153,20 +220,25 @@ DEFAULT_WHISPER_MODEL = "whisper-1"  # fixed
 # Auth mode selected from environment:
 #   GEMINI_API_KEY -> AI Studio
 #   GOOGLE_SERVICE_ACCOUNT_KEY or GOOGLE_APPLICATION_CREDENTIALS -> Vertex AI
-DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-live-preview"  # overridable
+DEFAULT_GEMINI_MODEL = "gemini-3.8-live-extended-thinking"  # overridable
 _LEGACY_GEMINI_MODEL = "gemini-live-2.5-flash-native-audio"
 DEFAULT_GEMINI_VOICE = "Zephyr"  # overridable
 DEFAULT_GEMINI_PROACTIVE_AUDIO = True  # fixed
 DEFAULT_GEMINI_LOCATION = "us-central1"  # fixed
-DEFAULT_GEMINI_INPUT_SAMPLE_RATE = 16000  # fixed, API-defined
+DEFAULT_GEMINI_INPUT_SAMPLE_RATE = 8000  # fixed, API-defined
 DEFAULT_GEMINI_OUTPUT_SAMPLE_RATE = 24000  # fixed, API-defined
+DEFAULT_GEMINI_TRANSCRIPTION_LANGUAGE_CODES = ["en-US"]  # overridable
 
 # =============================================================================
-# XAI PROVIDER (overridable voice, fixed API constants)
+# XAI PROVIDER (overridable model/voice, fixed API constants)
 # =============================================================================
 DEFAULT_XAI_REALTIME_BASE_URL = "wss://api.x.ai/v1/realtime"  # fixed
-DEFAULT_XAI_VOICE = "Ara"  # overridable: Ara, Rex, Sal, Eve, Leo
-DEFAULT_XAI_MODEL = "xai-realtime"  # fixed, determined by endpoint
+DEFAULT_XAI_VOICE = "ara"  # overridable; lowercase voice IDs (ara, rex, sal, eve, leo)
+# Model is selected via ?model= query param on the WebSocket URL.
+# Aliases: grok-voice-latest -> grok-voice-think-fast-2.0 (since 2026-08-05).
+# Reasoning: session.update reasoning.effort accepts "high" | "none"
+# (API default "high").
+DEFAULT_XAI_MODEL = "grok-voice-think-fast-2.0"  # overridable
 
 # =============================================================================
 # NOVA PROVIDER (overridable model/voice, fixed API constants)
@@ -183,38 +255,107 @@ DEFAULT_NOVA_OUTPUT_SAMPLE_RATE = 24000  # fixed, API-defined
 DEFAULT_QWEN_REALTIME_URL = (
     "wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime"  # fixed
 )
-DEFAULT_QWEN_MODEL = "qwen3-omni-flash-realtime"  # overridable
-DEFAULT_QWEN_VOICE = "Cherry"  # overridable
+# Qwen3.5-Omni realtime models support tool calling over WebSocket
+# (the older qwen3-omni-flash-realtime accepted tool configs but never
+# invoked them). Flash variant: qwen3.5-omni-flash-realtime.
+# Rate limits:
+# qwen3.5-omni-plus-realtime; 60 (requests per minute); 100,000 (tokens per minute)
+# qwen3.5-omni-plus-realtime-2026-03-15; 60 (requests per minute); 100,000 (tokens per minute)
+DEFAULT_QWEN_MODEL = "qwen3.5-omni-plus-realtime"  # overridable
+DEFAULT_QWEN_VOICE = "Tina"  # overridable; Qwen3.5-Omni-Realtime default voice
 DEFAULT_QWEN_INPUT_SAMPLE_RATE = 16000  # fixed, API-defined
 DEFAULT_QWEN_OUTPUT_SAMPLE_RATE = 24000  # fixed, API-defined
 
 # =============================================================================
+# AAI PROVIDER (local voice-agent host; overridable URL/rates)
+# =============================================================================
+DEFAULT_AAI_WS_URL = "ws://localhost:3000/websocket"  # overridable via AAI_WS_URL
+DEFAULT_AAI_MODEL = "host"  # fixed, determined by endpoint
+# No sample rates here: the harness declares none in its config frame and
+# adopts whatever the host answers in `session.configured`, so the agent's SDK
+# defaults decide (16 kHz in / 24 kHz out on the pipeline, 24/24 on S2S). The
+# rate is fixed by the host, not by us, and must never be hard-coded on this
+# side — S2S decodes every byte at 24 kHz regardless of what we declare, so a
+# mismatch leaves the agent deaf with no error.
+DEFAULT_AAI_CONFIG_FRAME_TIMEOUT = (
+    10.0  # seconds to await the server config handshake frame
+)
+# Empty: omitted from the host block, so the SDK's host-mode default (no
+# greeting) applies. tau2 already opens every call with its own
+# DEFAULT_FIRST_AGENT_MESSAGE, so the caller speaks first either way.
+DEFAULT_AAI_GREETING = ""
+
+# =============================================================================
+# PHONIC PROVIDER (overridable model; project via env var)
+# =============================================================================
+DEFAULT_PHONIC_API_BASE = "https://api.phonic.co/v1"
+DEFAULT_PHONIC_WS_BASE = "wss://api.phonic.co"
+DEFAULT_PHONIC_PROJECT = "main"  # overridable via PHONIC_PROJECT
+DEFAULT_PHONIC_MODEL = "phonic-1"  # overridable; sent as phonic_model
+DEFAULT_PHONIC_VOICE = "grant"
+
+# Explicit-language cascaded runs use the same speech models and voice in every
+# language. Flash supports language hints; Multilingual V2 does not.
+DEFAULT_CASCADED_MULTILINGUAL_STT_MODEL = "nova-3"
+DEFAULT_CASCADED_MULTILINGUAL_TTS_MODEL = "eleven_flash_v2_5"
+DEFAULT_CASCADED_MULTILINGUAL_VOICE_ID = "9BWtsMINqrJLrRacOk9x"  # Aria
+DEFAULT_CASCADED_TTS_SAMPLE_RATE = 24000
+
+# =============================================================================
+# AVARTHA (hosted agent over Pipecat SmallWebRTC)
+# =============================================================================
+DEFAULT_AVARTHA_MODEL = "avartha"  # recorded label; the URL selects the agent
+DEFAULT_AVARTHA_INPUT_SAMPLE_RATE = 16000  # caller audio track rate
+DEFAULT_AVARTHA_OUTPUT_SAMPLE_RATE = 24000  # agent audio is resampled to this
+DEFAULT_AVARTHA_BOOT_TIMEOUT_SECONDS = 45.0
+DEFAULT_AVARTHA_TOOL_REGISTRATION_TIMEOUT_SECONDS = 20.0
+DEFAULT_AVARTHA_BOOT_ATTEMPTS = 3
+
+# =============================================================================
 # PROVIDER REGISTRY (derived from above)
 # =============================================================================
+DEFAULT_LAUNA_MODEL = "launa-v1"
+LAUNA_SAMPLE_RATE = 24000  # fixed, both directions of the Launa voice API
+
 DEFAULT_AUDIO_NATIVE_MODELS = {
+    "launa": DEFAULT_LAUNA_MODEL,
     "openai": DEFAULT_OPENAI_REALTIME_MODEL,
+    "openai_live": DEFAULT_OPENAI_LIVE_MODEL,
     "gemini": DEFAULT_GEMINI_MODEL,
     "xai": DEFAULT_XAI_MODEL,
     "nova": DEFAULT_NOVA_MODEL,
     "qwen": DEFAULT_QWEN_MODEL,
+    "aai": DEFAULT_AAI_MODEL,
+    "avartha_pipecat": DEFAULT_AVARTHA_MODEL,
+    "phonic": DEFAULT_PHONIC_MODEL,
     "livekit": "dummy",
 }
 
 DEFAULT_AUDIO_NATIVE_REASONING_EFFORT: dict[str, str | None] = {
+    "launa": None,
     "openai": None,
+    "openai_live": None,
     "gemini": "high",
-    "xai": None,
+    "xai": "high",
     "nova": None,
     "qwen": None,
+    "aai": None,
+    "avartha_pipecat": None,
+    "phonic": "high",  # intelligence level; low/medium/minimal map to standard
     "livekit": None,
 }
 
 AUDIO_NATIVE_PROVIDER_TYPES = {
+    "launa": "audio_native",
     "openai": "audio_native",
+    "openai_live": "audio_native",
     "gemini": "audio_native",
     "xai": "audio_native",
     "nova": "audio_native",
     "qwen": "audio_native",
+    "aai": "audio_native",
+    "avartha_pipecat": "cascaded",
+    "phonic": "audio_native",
     "livekit": "cascaded",
 }
 
@@ -222,3 +363,27 @@ AUDIO_NATIVE_PROVIDER_TYPES = {
 # DISPLAY
 # =============================================================================
 TERM_DARK_MODE = True
+
+VOICE_INSTRUCTION_PROMPT_VERSION = "voice-instructions-v2"  # fixed prompt revision
+SPELLING_NORMALIZATION_VERSION = "explicit-spelling-v1"
+
+# Released benchmark conditions, supplied explicitly by benchmark entrypoints.
+# Selecting a language alone does not select these run conditions. Voice runs
+# default to the voice benchmark; text runs are custom unless `--benchmark text`.
+DEFAULT_VOICE_BENCHMARK = "voice"
+TEXT_BENCHMARK = "text"
+DEFAULT_BENCHMARK_WORKERS = 1
+DEFAULT_BENCHMARK_USER_MODEL = "openai/gpt-5.5"
+DEFAULT_BENCHMARK_USER_ARGS = {"reasoning_effort": "low"}
+DEFAULT_VOICE_BENCHMARK_MAX_STEPS_SECONDS = 2400
+DEFAULT_VOICE_BENCHMARK_OPENAI_VOICE = "marin"
+
+# Language factory authoring. These settings do not launch benchmark calls;
+# every authoring request still pins its own model and reasoning effort.
+DEFAULT_FACTORY_LOCALIZATION_BATCH_SIZE = 32
+DEFAULT_FACTORY_LOCALIZATION_CONCURRENCY = 3
+DATABASE_LOCALIZATION_PROSE_MAX_ENTRIES = 8
+DATABASE_LOCALIZATION_PROSE_MAX_SOURCE_CHARACTERS = 12000
+
+# Domain lookup behavior changes must not share benchmark condition fingerprints.
+DOMAIN_TOOLS_VERSION = "speech-identity-v1"

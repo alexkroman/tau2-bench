@@ -14,6 +14,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from tau2.config import DEFAULT_TELEPHONY_RATE, TELEPHONY_ULAW_SILENCE
 from tau2.data_model.message import ToolCall
+from tau2.data_model.transcript import LiveTranscriptTick
+from tau2.data_model.usage import UsageRecord
 from tau2.voice.utils.transcript_utils import get_proportional_text
 
 
@@ -100,6 +102,14 @@ class TickResult(BaseModel):
         description="All API events received during this tick (provider-specific types)",
         exclude=True,  # Exclude from serialization (may contain bytes)
     )
+    live_transcript: LiveTranscriptTick | None = None
+    # What the provider COMMITTED as the caller's turn this tick — the text its
+    # model was handed. Diagnostic only; kept apart from `live_transcript`,
+    # whose presence switches judges and views onto GPT Live's grouping.
+    provider_user_transcripts: List[str] = Field(
+        default_factory=list,
+        description="Caller turns the provider committed this tick, verbatim",
+    )
 
     # --- VAD events (provider-agnostic) ---
     # Normalized VAD event types detected this tick:
@@ -118,7 +128,20 @@ class TickResult(BaseModel):
         description="Tool calls detected during this tick",
     )
 
+    # --- Usage records reported this tick ---
+    # Provider-agnostic: adapters populate this from their usage/billing events.
+    # Intentionally serialized (unlike `events`) so usage survives into the
+    # trajectory via AssistantMessage.raw_data.
+    usage_records: List[UsageRecord] = Field(
+        default_factory=list,
+        description="Normalized provider usage reported during this tick",
+    )
+
     # --- Raw agent audio (unpadded) ---
+    contains_speech: Optional[bool] = Field(
+        default=None,
+        description="Speech activity for continuous media; None uses the legacy audio-presence rule",
+    )
     # These store the actual audio received from the API, without padding.
     # Use these to detect if agent actually spoke.
     agent_audio_chunks: List[Tuple[bytes, Optional[str]]] = Field(
@@ -433,7 +456,7 @@ def buffer_excess_audio(
     keep_chunks: List[Tuple[bytes, Optional[str]]] = []
     buffer_chunks: List[Tuple[bytes, Optional[str]]] = []
 
-    for chunk_data, item_id in result.agent_audio_chunks:
+    for index, (chunk_data, item_id) in enumerate(result.agent_audio_chunks):
         if total_bytes + len(chunk_data) <= bytes_per_tick:
             keep_chunks.append((chunk_data, item_id))
             total_bytes += len(chunk_data)
@@ -444,7 +467,9 @@ def buffer_excess_audio(
                 buffer_chunks.append((chunk_data[space_left:], item_id))
             else:
                 buffer_chunks.append((chunk_data, item_id))
-            total_bytes = bytes_per_tick
+            # The rest is already buffered; don't rescan a growing audio backlog.
+            buffer_chunks.extend(result.agent_audio_chunks[index + 1 :])
+            break
 
     result.agent_audio_chunks = keep_chunks
     return buffer_chunks

@@ -1,57 +1,91 @@
 import { useState, useEffect } from 'react'
 import './App.css'
+import { getViewFromPath, HYPER_TAU_URL, LEADERBOARD_MENU, TAU_ENTITY_PATH, PAGE_META, SITE_ORIGIN, VIEW_PATHS } from './routes'
 import TrajectoryVisualizer from './components/TrajectoryVisualizer'
 import Leaderboard from './components/Leaderboard'
 import LeaderboardPreview from './components/LeaderboardPreview'
+import EvolutionTimeline from './components/EvolutionTimeline'
 import Blog from './components/Blog'
+import Community from './components/Community'
+
+// Update the document head to match the current view. The prerender step
+// (scripts/prerender.mjs) snapshots the DOM after this runs, which is how
+// each prerendered page gets its own title/description/canonical tags.
+const setHeadContent = (selector, attr, value) => {
+  const el = document.head.querySelector(selector)
+  if (el) el.setAttribute(attr, value)
+}
+
+const applyPageMeta = (view) => {
+  const meta = PAGE_META[view]
+  if (!meta) return
+  const url = `${SITE_ORIGIN}${VIEW_PATHS[view] || '/'}`
+  document.title = meta.title
+  setHeadContent('meta[name="description"]', 'content', meta.description)
+  setHeadContent('link[rel="canonical"]', 'href', url)
+  setHeadContent('meta[property="og:url"]', 'content', url)
+  setHeadContent('meta[property="og:title"]', 'content', meta.title)
+  setHeadContent('meta[property="og:description"]', 'content', meta.description)
+  setHeadContent('meta[name="twitter:title"]', 'content', meta.title)
+  setHeadContent('meta[name="twitter:description"]', 'content', meta.description)
+}
+
+// Benchmark names use a caret for a superscript in plain text ("τ^τ-bench");
+// render it as one. Menu data stays JSX-free so the prerender script can
+// import it.
+const renderBenchName = (label) => {
+  const caret = label.indexOf('^')
+  if (caret === -1) return label
+  const rest = label.slice(caret + 1)
+  const supEnd = rest.search(/[^a-zA-Zα-ωΑ-Ω0-9]/)
+  const sup = supEnd === -1 ? rest : rest.slice(0, supEnd)
+  const tail = supEnd === -1 ? '' : rest.slice(supEnd)
+  return (
+    <>
+      {label.slice(0, caret)}<sup>{sup}</sup>{tail}
+    </>
+  )
+}
 
 function App() {
-  
-  // Initialize currentView based on URL hash (strip query params for view matching)
-  const getViewFromHash = (hash) => {
-    const base = hash.split('?')[0]
-    if (base === 'leaderboard') return 'leaderboard'
-    // #progress is a deep-link to the Progress-over-time panel inside the
-    // leaderboard view. The view is the leaderboard; the in-page scroll to
-    // #progress is handled by the effect below.
-    if (base === 'progress') return 'leaderboard'
-    if (base === 'trajectory-visualizer') return 'trajectory-visualizer'
-    if (base === 'blog') return 'blog'
-    if (base === 'results' || base === 'docs') return '__deprecated__'
-    return 'home'
-  }
 
-  const getInitialView = () => {
-    const hash = window.location.hash.slice(1)
-    const view = getViewFromHash(hash)
-    if (view === '__deprecated__') {
-      window.history.replaceState(null, '', '#home')
-      return 'home'
-    }
-    return view
-  }
-  
-  const [currentView, setCurrentView] = useState(getInitialView())
+  const [currentView, setCurrentView] = useState(() => getViewFromPath(window.location.pathname))
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
-  const [papersDropdownOpen, setPapersDropdownOpen] = useState(false)
+  const [leaderboardsOpen, setLeaderboardsOpen] = useState(false)
 
   // Handle navigation with URL updates
   const navigateTo = (view) => {
     setCurrentView(view)
     setMobileMenuOpen(false) // Close mobile menu when navigating
-    if (view === 'home') {
-      window.history.pushState(null, '', '#home')
-    } else if (view === 'leaderboard') {
-      window.history.pushState(null, '', '#leaderboard')
-    } else if (view === 'blog') {
-      window.history.pushState(null, '', '#blog')
-    } else if (view === 'trajectory-visualizer') {
-      // Preserve existing query params if already on the visualizer
-      const currentHash = window.location.hash || ''
-      if (!currentHash.startsWith('#trajectory-visualizer')) {
-        window.history.pushState(null, '', '#trajectory-visualizer')
-      }
+    const path = VIEW_PATHS[view]
+    if (!path) return
+    // Preserve existing query params when already on the target path (the
+    // visualizer and leaderboard keep their state in the query string).
+    if (window.location.pathname !== path) {
+      // Keep the query string when moving between two routes of the same
+      // view (e.g. /progress → /leaderboard both render the leaderboard,
+      // and ?benchmark=… should survive the switch).
+      const sameView = getViewFromPath(window.location.pathname) === view
+      window.history.pushState(null, '', sameView ? `${path}${window.location.search}` : path)
     }
+    // If the view didn't change, React won't re-render anything, so without
+    // this a nav click from e.g. /progress (scrolled to the chart) back to
+    // /leaderboard would visibly do nothing.
+    window.scrollTo(0, 0)
+  }
+
+  // Navigate to an app-internal URL (path + query), e.g. from the homepage
+  // preview cards: '/leaderboard?benchmark=voice'.
+  const navigateToUrl = (url) => {
+    window.history.pushState(null, '', url)
+    setCurrentView(getViewFromPath(new URL(url, window.location.origin).pathname))
+    // Views that keep state in the query string (the leaderboard's
+    // ?benchmark=…) re-read it on popstate; fire one so switching benchmarks
+    // from the nav menu works while that view is already mounted.
+    window.dispatchEvent(new PopStateEvent('popstate'))
+    setMobileMenuOpen(false)
+    setLeaderboardsOpen(false)
+    window.scrollTo(0, 0)
   }
 
   // Toggle mobile menu
@@ -61,12 +95,12 @@ function App() {
 
 
 
-  // Scroll to a specific section if the hash refers to one (e.g. #progress).
-  // Tries a few times with rAF + small timeouts so it works even if the
-  // target hasn't mounted yet (data-loading async views).
-  const scrollToSectionForHash = (hash) => {
-    const base = hash.split('?')[0]
-    const sectionId = base === 'progress' ? 'progress' : null
+  // Scroll to a specific section if the path refers to one (/progress is the
+  // leaderboard scrolled to the Progress-over-time panel). Tries a few times
+  // with rAF + small timeouts so it works even if the target hasn't mounted
+  // yet (data-loading async views).
+  const scrollToSectionForPath = (pathname) => {
+    const sectionId = pathname.replace(/\/$/, '') === '/progress' ? 'progress' : null
     if (!sectionId) return
     const tryScroll = (attemptsLeft) => {
       const el = document.getElementById(sectionId)
@@ -79,50 +113,47 @@ function App() {
     requestAnimationFrame(() => tryScroll(20))
   }
 
+  // Keep the document head (title, description, canonical, og:*) in sync
+  // with the current view.
+  useEffect(() => {
+    applyPageMeta(currentView)
+  }, [currentView])
+
   // Listen for browser back/forward button clicks and handle mobile menu
   useEffect(() => {
-    const handleHashChange = () => {
-      const hash = window.location.hash.slice(1)
-      const view = getViewFromHash(hash)
-      if (view === '__deprecated__') {
-        window.history.replaceState(null, '', '#home')
-        setCurrentView('home')
-      } else {
-        setCurrentView(view)
-        scrollToSectionForHash(hash)
-      }
-    }
-
     const handlePopState = () => {
-      handleHashChange()
+      setCurrentView(getViewFromPath(window.location.pathname))
+      setLeaderboardsOpen(false)
+      scrollToSectionForPath(window.location.pathname)
     }
 
-    // Close mobile menu when clicking outside
+    // Close mobile menu when clicking outside; same for the Leaderboards menu.
     const handleClickOutside = (event) => {
       if (mobileMenuOpen && !event.target.closest('.nav-container')) {
         setMobileMenuOpen(false)
       }
+      if (leaderboardsOpen && !event.target.closest('.nav-dropdown')) {
+        setLeaderboardsOpen(false)
+      }
+    }
+    const handleKeyDown = (event) => {
+      if (event.key === 'Escape') setLeaderboardsOpen(false)
     }
 
     // Listen to events
-    window.addEventListener('hashchange', handleHashChange)
     window.addEventListener('popstate', handlePopState)
     document.addEventListener('click', handleClickOutside)
+    document.addEventListener('keydown', handleKeyDown)
 
-    // Set initial URL if none exists
-    if (!window.location.hash) {
-      window.history.replaceState(null, '', '#home')
-    } else {
-      // Honor an initial deep-link like #progress on first paint.
-      scrollToSectionForHash(window.location.hash.slice(1))
-    }
+    // Honor an initial deep-link like /progress on first paint.
+    scrollToSectionForPath(window.location.pathname)
 
     return () => {
-      window.removeEventListener('hashchange', handleHashChange)
       window.removeEventListener('popstate', handlePopState)
       document.removeEventListener('click', handleClickOutside)
+      document.removeEventListener('keydown', handleKeyDown)
     }
-  }, [mobileMenuOpen])
+  }, [mobileMenuOpen, leaderboardsOpen])
 
   return (
     <div className="App">
@@ -146,10 +177,60 @@ function App() {
           </button>
           <div className={`nav-links ${mobileMenuOpen ? '' : 'mobile-hidden'}`}>
             <button onClick={() => navigateTo('home')} className={`nav-link ${currentView === 'home' ? 'active' : ''}`}>Overview</button>
-            <button onClick={() => navigateTo('leaderboard')} className={`nav-link ${currentView === 'leaderboard' ? 'active' : ''}`}>Leaderboard</button>
+            <div className={`nav-dropdown ${leaderboardsOpen ? 'open' : ''}`}>
+              <button
+                type="button"
+                onClick={() => setLeaderboardsOpen((open) => !open)}
+                className={`nav-link nav-dropdown-trigger ${currentView === 'leaderboard' ? 'active' : ''}`}
+                aria-haspopup="menu"
+                aria-expanded={leaderboardsOpen}
+              >
+                Leaderboards
+                <span className="nav-dropdown-chevron" aria-hidden="true" />
+              </button>
+              <div className="nav-dropdown-menu" role="menu" aria-label="Leaderboards">
+                {LEADERBOARD_MENU.map((item) =>
+                  item.href ? (
+                    <a
+                      key={item.key}
+                      role="menuitem"
+                      className="nav-dropdown-item external"
+                      href={item.href}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      aria-label={item.label}
+                      onClick={() => { setLeaderboardsOpen(false); setMobileMenuOpen(false) }}
+                    >
+                      <span className="nav-dropdown-item-label">
+                        <span className="nav-dropdown-item-name">{renderBenchName(item.label)}</span>
+                        {item.badge && <span className="nav-dropdown-badge">{item.badge}</span>}
+                        <span className="nav-dropdown-external" aria-hidden="true">↗</span>
+                      </span>
+                      <span className="nav-dropdown-item-note">{item.note}</span>
+                    </a>
+                  ) : (
+                    <button
+                      key={item.key}
+                      type="button"
+                      role="menuitem"
+                      className="nav-dropdown-item"
+                      onClick={() => navigateToUrl(item.path)}
+                    >
+                      <span className="nav-dropdown-item-label">
+                        <span className="nav-dropdown-item-name">{renderBenchName(item.label)}</span>
+                        {item.badge && <span className="nav-dropdown-badge">{item.badge}</span>}
+                      </span>
+                      <span className="nav-dropdown-item-note">{item.note}</span>
+                    </button>
+                  )
+                )}
+              </div>
+            </div>
             <button onClick={() => navigateTo('trajectory-visualizer')} className={`nav-link ${currentView === 'trajectory-visualizer' ? 'active' : ''}`}>Visualizer</button>
             <button onClick={() => navigateTo('blog')} className={`nav-link ${currentView === 'blog' ? 'active' : ''}`}>Blog</button>
+            <button onClick={() => navigateTo('community')} className={`nav-link ${currentView === 'community' ? 'active' : ''}`}>Community</button>
             <a href="https://github.com/sierra-research/tau2-bench" target="_blank" rel="noopener noreferrer" onClick={() => setMobileMenuOpen(false)}>GitHub</a>
+            <a href="https://github.com/sierra-research/tau2-bench/blob/main/docs/leaderboard-submission.md" target="_blank" rel="noopener noreferrer" onClick={() => setMobileMenuOpen(false)}>Submit Results</a>
           </div>
         </div>
       </nav>
@@ -158,78 +239,63 @@ function App() {
       <div className="update-notification">
         <div className="notification-container">
           <span className="notification-badge">NEW</span>
-          <span className="notification-text">
-            τ-bench now supports the <strong>banking domain</strong> and a <strong>voice mode</strong>, introduced by the{' '}
-            <a href={`${import.meta.env.BASE_URL}blog/tau-knowledge.html`} className="notification-link">τ-knowledge</a> and{' '}
-            <a href={`${import.meta.env.BASE_URL}blog/tau-voice-examples.html`} className="notification-link">τ-voice examples</a>.
-          </span>
+          <div className="notification-announcements">
+            <a href={HYPER_TAU_URL} className="notification-link" target="_blank" rel="noopener noreferrer">
+              <strong>τ<sup>τ</sup></strong><span>Agents building agents →</span>
+            </a>
+            <span className="notification-divider" aria-hidden="true" />
+            <a href="/leaderboard?benchmark=voice" className="notification-link">
+              <strong>τ-i18n</strong><span>Voice agents across six languages →</span>
+            </a>
+            <span className="notification-divider" aria-hidden="true" />
+            <a href={TAU_ENTITY_PATH} className="notification-link">
+              <strong>τ-Entity</strong><span>Capturing entities over voice →</span>
+            </a>
+          </div>
         </div>
       </div>
 
-      {/* Conditional Content Rendering */}
-      {currentView === 'home' ? (
-        <>
-          {/* Hero Section */}
-          <section className="hero">
-            <div className="hero-container-vertical">
-              <div className="hero-content-vertical">
-                <div className="hero-title-section">
-                  <h1 className="hero-main-title">
-                    <span className="tau-symbol">τ</span>
-                    <span className="bench-text">-bench</span>
-                  </h1>
-                </div>
-
-                <p className="hero-description">
-                  Benchmarking AI agents in collaborative real-world scenarios. 
-                  τ-bench challenges agents to coordinate, guide, and assist users 
-                  in achieving shared objectives across complex enterprise domains.
-                </p>
-
-                <div className="hero-actions">
-                  <div className="button-row">
-                    <a href="https://github.com/sierra-research/tau2-bench" target="_blank" rel="noopener noreferrer">
-                      <button className="btn-primary">View on GitHub</button>
-                    </a>
-                    <a href="https://github.com/sierra-research/tau2-bench/blob/main/docs/leaderboard-submission.md" target="_blank" rel="noopener noreferrer">
-                      <button className="btn-secondary">Submit Results</button>
-                    </a>
+      <main className="app-content">
+        {/* Conditional Content Rendering */}
+        {currentView === 'home' ? (
+          <>
+            {/* Hero Section */}
+            <section className="hero">
+              <div className="hero-container-vertical">
+                <div className="hero-content-vertical">
+                  <div className="hero-title-section">
+                    <h1 className="hero-main-title">
+                      <span className="tau-symbol">τ</span>
+                      <span className="bench-text">-bench</span>
+                    </h1>
                   </div>
-                  <div className="button-row">
-                    <div className="hero-dropdown" onMouseEnter={() => setPapersDropdownOpen(true)} onMouseLeave={() => setPapersDropdownOpen(false)}>
-                      <button className="btn-secondary">
-                        Read Papers <span className="dropdown-arrow">▾</span>
-                      </button>
-                      <div className={`hero-dropdown-menu ${papersDropdownOpen ? 'open' : ''}`}>
-                        <div className="hero-submenu-item">
-                          <span className="hero-submenu-label">τ³-bench <span className="submenu-arrow">›</span></span>
-                          <div className="hero-submenu">
-                            <a href="https://arxiv.org/abs/2603.04370" target="_blank" rel="noopener noreferrer">τ-Knowledge</a>
-                            <a href="https://arxiv.org/abs/2603.13686" target="_blank" rel="noopener noreferrer">τ-Voice</a>
-                          </div>
-                        </div>
-                        <a href="https://arxiv.org/abs/2506.07982" target="_blank" rel="noopener noreferrer">τ²-bench</a>
-                        <a href="https://arxiv.org/abs/2406.12045" target="_blank" rel="noopener noreferrer">τ-bench</a>
-                      </div>
-                    </div>
-                    <button className="btn-secondary" onClick={() => navigateTo('blog')}>Blog</button>
-                  </div>
-                </div>
 
-                <LeaderboardPreview onViewFullLeaderboard={() => navigateTo('leaderboard')} />
+                  <p className="hero-description">
+                    Can AI agents reliably complete real-world tasks?
+                    τ-bench measures how well agents converse with users, call tools,
+                    retrieve knowledge, and follow policy across enterprise domains — in text and voice.
+                  </p>
+
+                  <LeaderboardPreview
+                    onViewFullLeaderboard={() => navigateTo('leaderboard')}
+                    onNavigate={navigateToUrl}
+                  />
+                </div>
               </div>
-            </div>
-          </section>
+            </section>
 
-
-        </>
-      ) : currentView === 'leaderboard' ? (
-        <Leaderboard />
-      ) : currentView === 'trajectory-visualizer' ? (
-        <TrajectoryVisualizer />
-      ) : currentView === 'blog' ? (
-        <Blog />
-      ) : null}
+            <EvolutionTimeline />
+          </>
+        ) : currentView === 'leaderboard' ? (
+          <Leaderboard />
+        ) : currentView === 'trajectory-visualizer' ? (
+          <TrajectoryVisualizer />
+        ) : currentView === 'blog' ? (
+          <Blog />
+        ) : currentView === 'community' ? (
+          <Community />
+        ) : null}
+      </main>
 
       {/* Simple Footer */}
       <footer className="simple-footer">

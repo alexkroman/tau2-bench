@@ -295,9 +295,21 @@ class Environment:
         initialization_data: Optional[InitializationData],
         initialization_actions: Optional[list[EnvFunctionCall]],
         message_history: list[Message],
+        strict: bool = True,
     ):
         """
         Set the state of the environment given initialization data and a list of messages.
+
+        Args:
+            strict: When True (default), raise if a replayed mutating tool call
+                returns different content than the recorded ToolMessage. When
+                False, log a warning instead and continue the replay. Lenient
+                mode is intended for re-grading historical trajectories whose
+                recorded tool outputs contain cosmetic drift against current
+                tool code (e.g. numeric argument echoes rendered as `25` by the
+                code that produced them but `25.0` after numeric-argument
+                normalization); the state mutation is applied identically
+                either way.
         """
         if self.solo_mode:
             assert all(
@@ -338,16 +350,19 @@ class Environment:
             return actions
 
         if initialization_data is not None:
+            shared_db = (
+                self.user_tools is not None and self.user_tools.db is self.tools.db
+            )
             if initialization_data.agent_data is not None:
                 self.tools.update_db(initialization_data.agent_data)
                 # Sync user_tools.db to point to the same db instance as tools.db
                 # This is necessary because update_db creates a new db instance
-                if self.user_tools is not None and self.user_tools.db is not None:
+                if shared_db:
                     self.user_tools.db = self.tools.db
             if initialization_data.user_data is not None:
                 self.user_tools.update_db(initialization_data.user_data)
                 # Sync tools.db to point to the same db instance as user_tools.db
-                if self.tools is not None and self.tools.db is not None:
+                if shared_db:
                     self.tools.db = self.user_tools.db
 
         if initialization_actions is not None:
@@ -356,6 +371,11 @@ class Environment:
 
         action_responses = get_actions_from_messages(message_history)
         for tool_call, expected_response in action_responses:
+            if expected_response.execution_status == "rejected":
+                # The orchestrator rejected this call before the environment
+                # executed it. Failed executed calls still replay normally:
+                # a tool may have changed state before returning an error.
+                continue
             if not self._has_tool(tool_call.name):
                 # Hallucinated tool name. The live env returned a
                 # ToolMessage(error=True) for this call and made no state
@@ -385,8 +405,15 @@ class Environment:
             except json.JSONDecodeError:
                 expected_content = expected_response.content
             if content != expected_content:
-                raise ValueError(
-                    f"Tool call:\n{tool_call}\n\nReturned:\n{response}\n\nExpected:\n{expected_response}"
+                if strict:
+                    raise ValueError(
+                        f"Tool call:\n{tool_call}\n\nReturned:\n{response}\n\nExpected:\n{expected_response}"
+                    )
+                logger.warning(
+                    f"Replayed tool call '{tool_call.name}' returned different "
+                    f"content than the recorded ToolMessage; continuing because "
+                    f"strict=False. Recorded output may predate current tool "
+                    f"code.\nTool call:\n{tool_call}"
                 )
         self.sync_tools()
 

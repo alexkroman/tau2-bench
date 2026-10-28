@@ -5,8 +5,13 @@ from tau2.config import (
     DEFAULT_AGENT_IMPLEMENTATION,
     DEFAULT_AUDIO_NATIVE_MODELS,
     DEFAULT_AUDIO_NATIVE_PROVIDER,
+    DEFAULT_CHANNEL_EFFECTS_MODE,
+    DEFAULT_ELICITATION_LLM_ARGS_USER,
+    DEFAULT_ELICITATION_LLM_USER,
+    DEFAULT_ELICITATION_MAX_STEPS_SECONDS,
     DEFAULT_INTEGRATION_DURATION_SECONDS,
     DEFAULT_INTERRUPTION_CHECK_INTERVAL_SECONDS,
+    DEFAULT_LANGUAGE,
     DEFAULT_LLM_AGENT,
     DEFAULT_LLM_EVAL_USER_SIMULATOR,
     DEFAULT_LLM_LOG_MODE,
@@ -25,6 +30,7 @@ from tau2.config import (
     DEFAULT_SEED,
     DEFAULT_SILENCE_ANNOTATION_THRESHOLD_SECONDS,
     DEFAULT_SPEECH_COMPLEXITY,
+    DEFAULT_SPEECH_EFFECTS_MODE,
     DEFAULT_TELEPHONY_RATE,
     DEFAULT_TICK_DURATION_SECONDS,
     DEFAULT_USER_IMPLEMENTATION,
@@ -33,14 +39,14 @@ from tau2.config import (
     DEFAULT_YIELD_THRESHOLD_WHEN_INTERRUPTED_SECONDS,
     DEFAULT_YIELD_THRESHOLD_WHEN_INTERRUPTING_SECONDS,
 )
+from tau2.data_model.cascaded import CascadedConfigRequest
 from tau2.data_model.persona import PersonaConfig
-from tau2.data_model.simulation import (
-    AudioNativeConfig,
-    TextRunConfig,
-    VoiceRunConfig,
-)
+from tau2.data_model.run_config import AudioNativeConfig
+from tau2.data_model.simulation import TextRunConfig, VoiceRunConfig
 from tau2.domains.banking_knowledge.retrieval import get_all_variant_names
 from tau2.run import get_options, run_domain
+from tau2.runner.work import parse_provider_limits
+from tau2.voice.audio_native.avartha_pipecat.config import AvarthaPipecatConfig
 
 
 def get_all_retrieval_config_names():
@@ -49,13 +55,19 @@ def get_all_retrieval_config_names():
 
 def add_run_args(parser):
     """Add run arguments to a parser."""
+    from tau2.multilingual.cli import add_language_run_args
+    from tau2.runner.cli import add_benchmark_run_args
+
+    add_language_run_args(parser)
+    add_benchmark_run_args(parser)
     domains = get_options().domains
     parser.add_argument(
         "--domain",
         "-d",
         type=str,
         choices=domains,
-        help="The domain to run the simulation on",
+        action="append",
+        help="Domain filter; repeatable for released voice runs. Omit to run all released voice domains.",
     )
     parser.add_argument(
         "--num-trials",
@@ -92,14 +104,14 @@ def add_run_args(parser):
     parser.add_argument(
         "--user-llm",
         type=str,
-        default=DEFAULT_LLM_USER,
-        help=f"The LLM to use for the user. Default is {DEFAULT_LLM_USER}.",
+        default=None,
+        help=f"The LLM to use for the user. Default is {DEFAULT_LLM_USER}; τ-Entity uses {DEFAULT_ELICITATION_LLM_USER}.",
     )
     parser.add_argument(
         "--user-llm-args",
         type=json.loads,
-        default={"temperature": DEFAULT_LLM_TEMPERATURE_USER},
-        help=f"The arguments to pass to the LLM for the user. Default is '{{\"temperature\": {DEFAULT_LLM_TEMPERATURE_USER}}}'.",
+        default=None,
+        help=f"The arguments to pass to the LLM for the user. Default is '{{\"temperature\": {DEFAULT_LLM_TEMPERATURE_USER}}}'; the default τ-Entity caller uses {json.dumps(DEFAULT_ELICITATION_LLM_ARGS_USER)}.",
     )
     parser.add_argument(
         "--task-set-name",
@@ -118,13 +130,13 @@ def add_run_args(parser):
         "--task-ids",
         type=str,
         nargs="+",
-        help="(Optional) run only the tasks with the given IDs. If not provided, will run all tasks.",
+        help="Explicit task IDs. Released voice runs accept canonical IDs from exactly one domain; custom/text runs use ordinary task IDs.",
     )
     parser.add_argument(
         "--num-tasks",
         type=int,
         default=None,
-        help="The number of tasks to run.",
+        help="Tasks per domain: released voice runs select from each frozen subset, consistently across languages; custom/text runs use ordinary task selection.",
     )
     parser.add_argument(
         "--max-steps",
@@ -146,6 +158,7 @@ def add_run_args(parser):
     )
     parser.add_argument(
         "--save-to",
+        "--output",
         type=str,
         required=False,
         help="The path to save the simulation results. Will be saved to data/simulations/<save_to>/results.json. If not provided, will save to <timestamp>_<domain>_<agent>_<user>. If the file already exists, it will try to resume the run.",
@@ -154,7 +167,25 @@ def add_run_args(parser):
         "--max-concurrency",
         type=int,
         default=DEFAULT_MAX_CONCURRENCY,
-        help=f"The maximum number of concurrent simulations to run. Default is {DEFAULT_MAX_CONCURRENCY}.",
+        help=f"The maximum number of concurrent simulations to run. Default is {DEFAULT_MAX_CONCURRENCY}. "
+        "With --workers, this is the number of simulations each worker process holds.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Number of worker processes to spawn. Omitted or 0 runs custom runs in "
+        "this process; released benchmarks default to one worker and override 0 to one. "
+        "N > 0 makes this process a controller that schedules and checkpoints "
+        "while N worker processes execute (N x --max-concurrency simulations in flight); "
+        "use when scaling beyond the single-process concurrency ceiling.",
+    )
+    parser.add_argument(
+        "--provider-limit",
+        type=str,
+        default=None,
+        help='Per-provider concurrency caps in controller mode, e.g. "openai=40,gemini=20". '
+        "Requires --workers.",
     )
     parser.add_argument(
         "--seed",
@@ -239,7 +270,19 @@ def add_run_args(parser):
     parser.add_argument(
         "--audio-native-provider",
         type=str,
-        choices=["openai", "gemini", "xai", "livekit"],
+        choices=[
+            "openai",
+            "openai_live",
+            "gemini",
+            "xai",
+            "nova",
+            "qwen",
+            "aai",
+            "avartha_pipecat",
+            "phonic",
+            "livekit",
+            "launa",
+        ],
         default=DEFAULT_AUDIO_NATIVE_PROVIDER,
         help=f"Audio native API provider. Default is '{DEFAULT_AUDIO_NATIVE_PROVIDER}'.",
     )
@@ -249,13 +292,40 @@ def add_run_args(parser):
         default=None,
         help="Cascaded config preset name for livekit provider. "
         "Available presets: 'default', 'openai-thinking'. "
-        "See tau2.voice.audio_native.livekit.config for details.",
+        "See tau2.data_model.cascaded for details.",
     )
     parser.add_argument(
         "--audio-native-model",
         type=str,
         default=None,
-        help="Audio native model to use. If not specified, uses the default model for the selected provider.",
+        help="Audio native model to use. If not specified, uses the default model for the selected provider. "
+        "For avartha_pipecat, it is only a label, since --avartha-base-url "
+        "selects the agent.",
+    )
+    parser.add_argument(
+        "--avartha-base-url",
+        default=None,
+        help=(
+            "URL of the hosted Avartha agent the avartha_pipecat provider calls, "
+            "https://<host>/inference/serverless/pipecat/v1/public/<agent_id>. "
+            "Required for that provider, which also needs the live extra and "
+            "AVARTHA_API_KEY."
+        ),
+    )
+    parser.add_argument(
+        "--live-config",
+        type=json.loads,
+        default=None,
+        help="JSON config for openai_live: backend_model (required), voice, and optional frontend_prompt/backend_prompt overrides.",
+    )
+    parser.add_argument(
+        "--realtime-generation",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Run user LLM/TTS generation without blocking audio ticks. "
+        "Defaults to enabled for openai_live and avartha_pipecat and disabled for "
+        "other providers. "
+        "Use --no-realtime-generation to disable.",
     )
     parser.add_argument(
         "--reasoning-effort",
@@ -273,8 +343,8 @@ def add_run_args(parser):
     parser.add_argument(
         "--max-steps-seconds",
         type=int,
-        default=DEFAULT_MAX_STEPS_SECONDS,
-        help=f"Maximum conversation duration in seconds for audio-native mode. Default is {DEFAULT_MAX_STEPS_SECONDS}.",
+        default=None,
+        help=f"Maximum conversation duration in seconds. Default is {DEFAULT_MAX_STEPS_SECONDS}; τ-Entity uses {DEFAULT_ELICITATION_MAX_STEPS_SECONDS}.",
     )
     parser.add_argument(
         "--speech-complexity",
@@ -293,6 +363,18 @@ def add_run_args(parser):
         ],
         default=DEFAULT_SPEECH_COMPLEXITY,
         help=f"Speech complexity level for audio effects. Default is '{DEFAULT_SPEECH_COMPLEXITY}'.",
+    )
+    parser.add_argument(
+        "--channel-effects-mode",
+        choices=("light", "regular", "heavy"),
+        default=DEFAULT_CHANNEL_EFFECTS_MODE,
+        help="Caller channel overlay for voice runs; regular keeps existing acoustics.",
+    )
+    parser.add_argument(
+        "--speech-effects-mode",
+        choices=("light", "regular", "heavy"),
+        default=DEFAULT_SPEECH_EFFECTS_MODE,
+        help="Caller speech-behavior overlay for voice runs; regular keeps existing behavior.",
     )
 
     # Audio-native: Sample rates
@@ -368,6 +450,10 @@ def add_run_args(parser):
         default=False,
         help="Use plain text system prompt without XML tags (overrides auto-detection).",
     )
+
+    from tau2.domains.intake.cli import add_intake_run_args
+
+    add_intake_run_args(parser)
 
     # Knowledge domain arguments
     parser.add_argument(
@@ -505,6 +591,10 @@ def run_intro():
         "Knowledge-retrieval-based customer service with configurable RAG pipelines",
     )
     domain_table.add_row("mock", "Lightweight test domain for development")
+    domain_table.add_row(
+        "intake",
+        "τ-Entity: agent-directed voice elicitation; optional scaffolded ablation",
+    )
     console.print(domain_table)
     console.print()
 
@@ -535,6 +625,9 @@ def run_intro():
     cmd_table.add_row("tau2 submit prepare", "Prepare a leaderboard submission")
     cmd_table.add_row("tau2 submit validate", "Validate a submission directory")
     cmd_table.add_row("tau2 check-data", "Verify data directory is set up correctly")
+    cmd_table.add_row(
+        "tau2 intake-tasks", "Enumerate, reproduce, and verify frozen τ-Entity tasks"
+    )
     cmd_table.add_row("tau2 start", "Start background servers")
     cmd_table.add_row("tau2 intro", "Show this page")
     console.print(cmd_table)
@@ -580,11 +673,62 @@ def main():
     parser = argparse.ArgumentParser(description="Tau2 command line interface")
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
+    # Saved-run diagnostics are registered by their owning package.
+    from tau2.judges.cli import add_judges_args
+
+    add_judges_args(
+        subparsers.add_parser("judges", help="Saved-run diagnostic judging and reports")
+    )
+
+    from tau2.config import DEFAULT_TASK_SUBSET_SEED, DEFAULT_TASK_SUBSET_SIZE
+    from tau2.multilingual.factory.cli import add_factory_args
+    from tau2.task_subsets.cli import add_tasks_args
+
+    add_tasks_args(
+        subparsers.add_parser("tasks", help="Frozen canonical task subsets"),
+        default_size=DEFAULT_TASK_SUBSET_SIZE,
+        default_seed=DEFAULT_TASK_SUBSET_SEED,
+    )
+    add_factory_args(
+        subparsers.add_parser(
+            "factory", help="Staged language authoring and publication"
+        )
+    )
+
     # Run command
+    from tau2.runner.cli import add_benchmarks_args
+
+    add_benchmarks_args(
+        subparsers.add_parser(
+            "benchmarks", help="Released benchmark manifests and their pins"
+        )
+    )
+
     run_parser = subparsers.add_parser("run", help="Run a benchmark")
     add_run_args(run_parser)
 
     def run_command(args):
+        from tau2.runner.cli import selected_benchmark
+
+        args.benchmark = selected_benchmark(args) or "none"
+        benchmark_mode = args.benchmark != "none"
+        if not args.audio_native and (
+            args.channel_effects_mode != "regular"
+            or args.speech_effects_mode != "regular"
+        ):
+            raise ValueError("Voice effects modes require --audio-native")
+        if not benchmark_mode and (
+            len(args.domain or []) > 1 or len(args.language or []) > 1
+        ):
+            raise ValueError(
+                "Custom/text runs require one domain and at most one language"
+            )
+        if not benchmark_mode and args.global_limit is not None:
+            raise ValueError("--global-limit applies to released benchmarks")
+        if benchmark_mode:
+            from tau2.runner.cli import check_benchmark_selection
+
+            check_benchmark_selection(args)
         user_persona_config = None
         if args.user_persona:
             user_persona_config = PersonaConfig.from_dict(args.user_persona)  # noqa: F841
@@ -599,6 +743,20 @@ def main():
                     args.audio_native_provider
                 ]
 
+            avartha_config = None
+            if args.audio_native_provider == "avartha_pipecat":
+                if not args.avartha_base_url:
+                    run_parser.error(
+                        "--avartha-base-url is required when "
+                        "--audio-native-provider avartha_pipecat"
+                    )
+                try:
+                    avartha_config = AvarthaPipecatConfig(
+                        base_url=args.avartha_base_url
+                    )
+                except ValueError as exc:
+                    run_parser.error(f"invalid Avartha configuration: {exc}")
+
             # Determine use_xml_prompt: defaults to False (plain text)
             use_xml_prompt = False
             if args.xml_prompt:
@@ -608,11 +766,23 @@ def main():
                 # Provider
                 provider=args.audio_native_provider,
                 model=audio_native_model,
-                cascaded_config_name=args.cascaded_config,
+                avartha_config=avartha_config,
+                cascaded_request=(
+                    CascadedConfigRequest(preset=args.cascaded_config)
+                    if args.cascaded_config is not None
+                    else None
+                ),
                 reasoning_effort=args.reasoning_effort,
+                **({"voice": args.voice} if args.voice is not None else {}),
+                live_config=args.live_config,
+                realtime_generation=args.realtime_generation,
                 # Timing
                 tick_duration_seconds=args.tick_duration,
-                max_steps_seconds=args.max_steps_seconds,
+                **(
+                    {"max_steps_seconds": args.max_steps_seconds}
+                    if args.max_steps_seconds is not None
+                    else {}
+                ),
                 # Sample rates
                 pcm_sample_rate=args.pcm_sample_rate,
                 telephony_rate=args.telephony_rate,
@@ -634,19 +804,35 @@ def main():
         set_llm_log_mode(args.llm_log_mode)
 
         # Shared config kwargs
+        from tau2.multilingual.runtime import extension_for_domain
+
+        pack_extension = (
+            extension_for_domain(
+                args.language[0] if args.language else DEFAULT_LANGUAGE,
+                args.domain[0],
+            )
+            if not benchmark_mode and args.domain and args.localize_db is not False
+            else None
+        )
         shared_kwargs = dict(
-            domain=args.domain,
+            localize_db=args.localize_db,
+            **(
+                {}
+                if benchmark_mode or not args.language
+                else {"language": args.language[0]}
+            ),
+            pack_extension=pack_extension,
             task_set_name=args.task_set_name,
             task_split_name=args.task_split_name,
             task_ids=args.task_ids,
             num_tasks=args.num_tasks,
-            llm_user=args.user_llm,
-            llm_args_user=args.user_llm_args,
             num_trials=args.num_trials,
             max_errors=args.max_errors,
             timeout=args.timeout,
             save_to=args.save_to,
             max_concurrency=args.max_concurrency,
+            workers=0 if benchmark_mode else (args.workers or 0),
+            provider_limits=parse_provider_limits(args.provider_limit),
             seed=args.seed,
             log_level=args.log_level,
             verbose_logs=args.verbose_logs,
@@ -661,11 +847,30 @@ def main():
             retrieval_config_kwargs=args.retrieval_config_kwargs,
         )
 
+        from tau2.domains.intake.cli import elicitation_config_from_args
+
+        if not benchmark_mode and args.domain:
+            shared_kwargs["domain"] = args.domain[0]
+        from tau2.multilingual.cli import communicate_scoring_from_args
+
+        communicate_scoring = communicate_scoring_from_args(args)
+        if communicate_scoring is not None:
+            shared_kwargs["communicate_scoring"] = communicate_scoring
+        shared_kwargs["elicitation"] = elicitation_config_from_args(args)
+        if args.user_llm is not None:
+            shared_kwargs["llm_user"] = args.user_llm
+        if args.user_llm_args is not None:
+            shared_kwargs["llm_args_user"] = args.user_llm_args
+
         if audio_native_config is not None:
             config = VoiceRunConfig(
                 **shared_kwargs,
                 audio_native_config=audio_native_config,
                 speech_complexity=args.speech_complexity,
+                channel_effects_mode=args.channel_effects_mode,
+                speech_effects_mode=args.speech_effects_mode,
+                pass3_condition=getattr(args, "pass3_condition", None),
+                voice_sampling_seed=getattr(args, "voice_sampling_seed", None),
                 audio_debug=getattr(args, "audio_debug", False),
                 audio_taps=getattr(args, "audio_taps", False),
             )
@@ -680,9 +885,39 @@ def main():
                 enforce_communication_protocol=args.enforce_communication_protocol,
             )
 
+        if benchmark_mode:
+            from tau2.runner.cli import run_benchmark
+
+            return run_benchmark(args, config)
+        if args.dry_run:
+            config.validate()
+            print(config.model_dump_json(indent=2))
+            return config
         return run_domain(config)
 
     run_parser.set_defaults(func=run_command)
+
+    from tau2.runner.cli import add_pass3_args
+
+    add_pass3_args(
+        subparsers.add_parser(
+            "run-pass3", help="Run Pass^3 on three ordinary or crossed trials"
+        ),
+        add_run_args=add_run_args,
+        run_command=run_command,
+    )
+
+    from tau2.multilingual.cli import add_languages_args
+
+    languages_parser = subparsers.add_parser(
+        "languages", help="Inspect and validate published language packs"
+    )
+    add_languages_args(languages_parser)
+    from tau2.domains.intake.tasks.cli import add_intake_tasks_args
+
+    add_intake_tasks_args(
+        subparsers.add_parser("intake-tasks", help="Generate and verify τ-Entity tasks")
+    )
 
     # Play command
     play_parser = subparsers.add_parser(
@@ -695,12 +930,12 @@ def main():
     view_parser.add_argument(
         "--dir",
         type=str,
-        help="Directory containing simulation files. Defaults to data/simulations if not specified.",
+        help="Directory containing simulation files, or a benchmark matrix root. Defaults to data/simulations.",
     )
     view_parser.add_argument(
         "--file",
         type=str,
-        help="Path to the simulation results file to view",
+        help="Path to a simulation results file, ordinary run directory, or benchmark matrix root",
     )
     view_parser.add_argument(
         "--only-show-failed",
@@ -717,6 +952,17 @@ def main():
         action="store_true",
         help="Show expanded tick view instead of consolidated (for full-duplex simulations).",
     )
+    view_parser.add_argument(
+        "--max-tool-result-chars",
+        type=int,
+        default=500,
+        help="Truncate tool results (e.g. retrieved knowledge articles) to this many characters. Default: 500.",
+    )
+    view_parser.add_argument(
+        "--full-tool-results",
+        action="store_true",
+        help="Show full tool results without truncation.",
+    )
     view_parser.set_defaults(func=lambda args: run_view_simulations(args))
 
     # Domain command
@@ -731,6 +977,40 @@ def main():
     # Start command
     start_parser = subparsers.add_parser("start", help="Start all servers")
     start_parser.set_defaults(func=lambda args: run_start_servers())
+
+    # Worker command (executes simulations for a `tau2 run --workers N` controller)
+    worker_parser = subparsers.add_parser(
+        "worker",
+        help="Run a worker process that executes simulations for a tau2 controller "
+        "(see `tau2 run --workers`).",
+    )
+    worker_parser.add_argument(
+        "--controller",
+        type=str,
+        required=True,
+        help="Controller base URL, e.g. http://127.0.0.1:8321",
+    )
+    worker_parser.add_argument(
+        "--slots",
+        type=int,
+        default=10,
+        help="Concurrent simulations this worker holds (default: 10).",
+    )
+    worker_parser.add_argument(
+        "--worker-id",
+        type=str,
+        default=None,
+        help="Worker identity in controller logs (default: hostname-pid).",
+    )
+
+    def worker_command(args):
+        from tau2.runner.worker import run_worker_command
+
+        return run_worker_command(
+            controller=args.controller, slots=args.slots, worker_id=args.worker_id
+        )
+
+    worker_parser.set_defaults(func=worker_command)
 
     # Intro command
     intro_parser = subparsers.add_parser(
@@ -757,6 +1037,11 @@ def main():
         "-o",
         "--output-dir",
         help="Directory to save updated trajectory files with recomputed rewards. If not provided, only displays metrics.",
+    )
+    evaluate_parser.add_argument(
+        "--fresh-tasks",
+        action="store_true",
+        help="Re-grade against the current task definitions from the data directory instead of the ones embedded in each results file.",
     )
     evaluate_parser.set_defaults(func=lambda args: run_evaluate_trajectories(args))
 
@@ -855,82 +1140,9 @@ def main():
     )
     leaderboard_parser.set_defaults(func=lambda args: run_leaderboard(args))
 
-    # Submit command with subcommands
-    submit_parser = subparsers.add_parser(
-        "submit", help="Submission management for the leaderboard"
-    )
-    submit_subparsers = submit_parser.add_subparsers(
-        dest="submit_command", help="Submit subcommands", required=True
-    )
+    from tau2.scripts.leaderboard.cli import add_submit_args
 
-    # Submit prepare subcommand
-    submit_prepare_parser = submit_subparsers.add_parser(
-        "prepare", help="Prepare a submission for the leaderboard"
-    )
-    submit_prepare_parser.add_argument(
-        "input_paths",
-        nargs="+",
-        help="Paths to trajectory files, directories, or glob patterns",
-    )
-    submit_prepare_parser.add_argument(
-        "--output",
-        "-o",
-        required=True,
-        help="Output directory to save the submission and trajectories",
-    )
-    submit_prepare_parser.add_argument(
-        "--no-verify",
-        action="store_true",
-        help="Skip trajectory verification step",
-    )
-    submit_prepare_parser.add_argument(
-        "--voice",
-        action="store_true",
-        default=None,
-        help="Force voice submission mode (auto-detected from input data if not specified)",
-    )
-    submit_prepare_parser.set_defaults(func=lambda args: run_prepare_submission(args))
-
-    # Submit validate subcommand
-    submit_validate_parser = submit_subparsers.add_parser(
-        "validate", help="Validate an existing submission directory"
-    )
-    submit_validate_parser.add_argument(
-        "submission_dir",
-        help="Path to the submission directory to validate",
-    )
-    submit_validate_parser.set_defaults(func=lambda args: run_validate_submission(args))
-
-    # Submit verify-trajs subcommand
-    submit_verify_parser = submit_subparsers.add_parser(
-        "verify-trajs", help="Verify trajectory files"
-    )
-    submit_verify_parser.add_argument(
-        "paths",
-        nargs="+",
-        help="Paths to trajectory files, directories, or glob patterns",
-    )
-    submit_verify_parser.set_defaults(func=lambda args: run_verify_trajectories(args))
-
-    # Submit interaction-metrics subcommand
-    submit_im_parser = submit_subparsers.add_parser(
-        "interaction-metrics",
-        help="Compute voice interaction metrics (latency, responsiveness, "
-        "interrupts, selectivity) from full-duplex trajectories",
-    )
-    submit_im_parser.add_argument(
-        "input_paths",
-        nargs="+",
-        help="Voice experiment directories (results.json + simulations/) or a "
-        "parent directory such as a submission's trajectories/ dir",
-    )
-    submit_im_parser.add_argument(
-        "--output",
-        "-o",
-        default=None,
-        help="Optional path to write the interaction_metrics JSON block",
-    )
-    submit_im_parser.set_defaults(func=lambda args: run_interaction_metrics(args))
+    add_submit_args(subparsers.add_parser("submit", help="Leaderboard submissions"))
 
     # Convert results format command
     convert_parser = subparsers.add_parser(
@@ -967,12 +1179,18 @@ def main():
 def run_view_simulations(args):
     from tau2.scripts.view_simulations import main as view_main
 
+    if args.full_tool_results or args.max_tool_result_chars <= 0:
+        max_tool_result_length = None
+    else:
+        max_tool_result_length = args.max_tool_result_chars
+
     view_main(
         sim_file=args.file,
         only_show_failed=args.only_show_failed,
         only_show_all_failed=args.only_show_all_failed,
         sim_dir=args.dir,
         expanded_ticks=args.expanded_ticks,
+        max_tool_result_length=max_tool_result_length,
     )
 
 
@@ -994,21 +1212,6 @@ def run_check_data():
     check_data_main()
 
 
-def run_verify_trajectories(args):
-    import sys
-
-    from loguru import logger
-
-    from tau2.scripts.leaderboard.verify_trajectories import (
-        VerificationMode,
-        verify_trajectories,
-    )
-
-    logger.configure(handlers=[{"sink": sys.stderr, "level": "ERROR"}])
-
-    verify_trajectories(args.paths, VerificationMode.PUBLIC)
-
-
 def run_evaluate_trajectories(args):
     import sys
 
@@ -1018,7 +1221,9 @@ def run_evaluate_trajectories(args):
 
     logger.configure(handlers=[{"sink": sys.stderr, "level": "ERROR"}])
 
-    evaluate_trajectories(args.paths, args.output_dir)
+    evaluate_trajectories(
+        args.paths, args.output_dir, fresh_tasks=getattr(args, "fresh_tasks", False)
+    )
 
 
 def run_review(args):
@@ -1073,37 +1278,6 @@ def run_review(args):
             log_llm=args.log_llm,
             review_model=args.review_model,
         )
-
-
-def run_prepare_submission(args):
-    """Run the prepare submission command."""
-    from tau2.scripts.leaderboard.prepare_submission import prepare_submission
-
-    prepare_submission(
-        input_paths=args.input_paths,
-        output_dir=args.output,
-        run_verification=not args.no_verify,
-        voice=args.voice if args.voice else None,
-    )
-
-
-def run_validate_submission(args):
-    """Run the validate submission command."""
-    from tau2.scripts.leaderboard.prepare_submission import validate_submission
-
-    validate_submission(submission_dir=args.submission_dir)
-
-
-def run_interaction_metrics(args):
-    """Run the interaction metrics computation command."""
-    from tau2.scripts.leaderboard.compute_interaction_metrics import (
-        compute_interaction_metrics,
-    )
-
-    compute_interaction_metrics(
-        input_paths=args.input_paths,
-        output_path=args.output,
-    )
 
 
 def run_manual_mode():

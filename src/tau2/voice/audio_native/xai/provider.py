@@ -26,6 +26,7 @@ from pydantic import BaseModel
 
 from tau2.config import (
     DEFAULT_TELEPHONY_RATE,
+    DEFAULT_XAI_MODEL,
     DEFAULT_XAI_REALTIME_BASE_URL,
     DEFAULT_XAI_VOICE,
 )
@@ -106,18 +107,24 @@ class XAIRealtimeProvider:
     def __init__(
         self,
         api_key: Optional[str] = None,
+        model: Optional[str] = None,
         voice: Optional[str] = None,
         audio_format: XAIAudioFormat = XAIAudioFormat.PCMU,
         sample_rate: int = DEFAULT_TELEPHONY_RATE,
+        language_hint: Optional[str] = None,
     ):
         """Initialize the xAI Realtime provider.
 
         Args:
             api_key: xAI API key. If not provided, reads from XAI_API_KEY
                 environment variable.
-            voice: Voice to use. One of: Ara, Rex, Sal, Eve, Leo. Defaults to Ara.
+            model: Model to use, passed as ?model= on the WebSocket URL
+                (e.g. grok-voice-think-fast-2.0). Defaults to DEFAULT_XAI_MODEL.
+            voice: Voice to use (lowercase voice ID, e.g. ara, rex, sal, eve,
+                leo). Defaults to ara.
             audio_format: Audio format for input/output. Defaults to PCMU (G.711 μ-law)
                 which is optimal for telephony (no conversion needed).
+            language_hint: BCP-47 ASR bias sent in audio.input.transcription.
             sample_rate: Sample rate for PCM format (ignored for PCMU/PCMA).
                 Supported: 8000, 16000, 24000, 32000, 44100, 48000. Default: 8000.
 
@@ -128,9 +135,11 @@ class XAIRealtimeProvider:
         if not self.api_key:
             raise ValueError("xAI API key not provided. Set XAI_API_KEY env var.")
 
+        self.model = model or DEFAULT_XAI_MODEL
         self.voice = voice or self.DEFAULT_VOICE
         self.audio_format = audio_format
         self.sample_rate = sample_rate
+        self.language_hint = language_hint
         self.ws: Optional[websockets.WebSocketClientProtocol] = None
         self._current_vad_config: Optional[XAIVADConfig] = None
         self.session_id: Optional[str] = None
@@ -162,17 +171,22 @@ class XAIRealtimeProvider:
             "Content-Type": "application/json",
         }
 
-        logger.info(f"xAI Realtime API: Connecting to {self.BASE_URL}")
-        self.ws = await websockets.connect(self.BASE_URL, additional_headers=headers)
+        url = f"{self.BASE_URL}?model={self.model}"
+        logger.info(f"xAI Realtime API: Connecting to {url}")
+        self.ws = await websockets.connect(url, additional_headers=headers)
 
-        # Wait for conversation.created event
+        # Wait for the connection-established event. Older xAI endpoints sent
+        # conversation.created; newer ones send session.created (OpenAI-style).
         response = await self.ws.recv()
         data = json.loads(response)
-        if data.get("type") != "conversation.created":
-            raise RuntimeError(f"Expected conversation.created, got {data.get('type')}")
+        event_type = data.get("type")
+        if event_type not in ("conversation.created", "session.created"):
+            raise RuntimeError(
+                f"Expected conversation.created or session.created, got {event_type}"
+            )
 
         # Store conversation/session ID for debugging
-        conv_data = data.get("conversation", {})
+        conv_data = data.get("conversation") or data.get("session") or {}
         self.session_id = conv_data.get("id") or data.get("event_id")
         logger.info(
             f"xAI Realtime API: Connected successfully (session_id={self.session_id})"
@@ -190,22 +204,25 @@ class XAIRealtimeProvider:
         """Build the audio configuration for the session."""
         if self.audio_format == XAIAudioFormat.PCMU:
             # G.711 μ-law at 8kHz (telephony)
-            return {
+            config = {
                 "input": {"format": {"type": "audio/pcmu"}},
                 "output": {"format": {"type": "audio/pcmu"}},
             }
         elif self.audio_format == XAIAudioFormat.PCMA:
             # G.711 A-law at 8kHz
-            return {
+            config = {
                 "input": {"format": {"type": "audio/pcma"}},
                 "output": {"format": {"type": "audio/pcma"}},
             }
         else:
             # PCM with configurable sample rate
-            return {
+            config = {
                 "input": {"format": {"type": "audio/pcm", "rate": self.sample_rate}},
                 "output": {"format": {"type": "audio/pcm", "rate": self.sample_rate}},
             }
+        if self.language_hint:
+            config["input"]["transcription"] = {"language_hint": self.language_hint}
+        return config
 
     def _build_turn_detection_config(self, vad_config: XAIVADConfig) -> Optional[Dict]:
         """Build the turn detection configuration."""
@@ -237,6 +254,7 @@ class XAIRealtimeProvider:
         system_prompt: str,
         tools: List[Tool],
         vad_config: XAIVADConfig,
+        reasoning_effort: Optional[str] = None,
     ) -> None:
         """Configure the realtime session with instructions, tools, and settings.
 
@@ -244,6 +262,8 @@ class XAIRealtimeProvider:
             system_prompt: The system instructions for the assistant.
             tools: List of tools available for the assistant to use.
             vad_config: Voice Activity Detection configuration.
+            reasoning_effort: Reasoning effort, "high" or "none". If None, the
+                API default ("high") applies.
 
         Raises:
             RuntimeError: If not connected or if session configuration fails.
@@ -261,6 +281,8 @@ class XAIRealtimeProvider:
                 "tools": self._format_tools_for_api(tools),
             },
         }
+        if reasoning_effort is not None:
+            session_config["session"]["reasoning"] = {"effort": reasoning_effort}
 
         logger.debug(f"xAI session config: {json.dumps(session_config, indent=2)}")
         await self.ws.send(json.dumps(session_config))

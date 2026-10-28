@@ -10,7 +10,8 @@ create_adapter(): Factory function that validates parameters and constructs
 
 import asyncio
 from abc import ABC, abstractmethod
-from typing import Any, Awaitable, Callable, List, Optional, Tuple
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, List, Optional, Tuple
 
 from loguru import logger
 
@@ -22,6 +23,7 @@ from tau2.config import (
     TELEPHONY_ULAW_SILENCE,
 )
 from tau2.data_model.audio import TELEPHONY_AUDIO_FORMAT, AudioFormat
+from tau2.data_model.usage import UsageRecord
 from tau2.environment.tool import Tool
 from tau2.voice.audio_native.tick_result import (
     TickResult,
@@ -29,6 +31,10 @@ from tau2.voice.audio_native.tick_result import (
     buffer_excess_audio,
     get_proportional_transcript,
 )
+
+if TYPE_CHECKING:
+    from tau2.data_model.live_config import LiveConfig
+    from tau2.voice.audio_native.avartha_pipecat.config import AvarthaPipecatConfig
 
 
 class DiscreteTimeAdapter(ABC):
@@ -90,6 +96,8 @@ class DiscreteTimeAdapter(ABC):
             self.audio_format.bytes_per_second * tick_duration_ms / 1000
         )
         self.send_audio_instant = send_audio_instant
+        self.realtime_pacing = False
+        self._next_tick_start: float | None = None
         self._voip_interval_ms = DEFAULT_AUDIO_NATIVE_VOIP_PACKET_INTERVAL_MS
 
         # Shared tick state (managed by _async_run_tick template)
@@ -105,6 +113,12 @@ class DiscreteTimeAdapter(ABC):
         # different content IDs). Subclasses that need it should populate this
         # dict; get_proportional_transcript will forward it automatically.
         self._item_id_map: Optional[dict[str, str]] = None
+
+        # Usage ledger. Survives disconnect() (which only clears tick buffers)
+        # so the orchestrator can collect usage after the agent is stopped.
+        self._usage_records: List[UsageRecord] = []
+        self._tick_usage_buffer: List[UsageRecord] = []
+        self._current_tick_number: Optional[int] = None
 
     @abstractmethod
     def connect(
@@ -168,11 +182,39 @@ class DiscreteTimeAdapter(ABC):
         logger.debug(f"Queued tool result for call_id={call_id}")
 
     def clear_buffers(self) -> None:
-        """Reset all internal tick state."""
+        """Reset all internal tick state.
+
+        Note: the usage ledger is deliberately NOT cleared — usage must
+        survive disconnect() so it can be collected at simulation end.
+        """
         self._buffered_agent_audio.clear()
+        self._next_tick_start = None
         self._utterance_transcripts.clear()
         self._pending_tool_results.clear()
         self._skip_item_id = None
+
+    # -----------------------------------------------------------------------
+    # Usage tracking
+    # -----------------------------------------------------------------------
+
+    def record_usage(self, record: UsageRecord) -> None:
+        """Record a usage observation from the provider.
+
+        Appends to the session ledger (returned by get_usage_records) and to
+        the current tick's buffer (drained into TickResult.usage_records).
+        """
+        if record.tick_number is None:
+            record.tick_number = self._current_tick_number
+        self._usage_records.append(record)
+        self._tick_usage_buffer.append(record)
+
+    def get_usage_records(self) -> List[UsageRecord]:
+        """All usage records collected over the adapter's lifetime.
+
+        Safe to call after disconnect(). Subclasses may override to append
+        live counters (e.g. LiveKit's cumulative STT audio meter).
+        """
+        return list(self._usage_records)
 
     # -----------------------------------------------------------------------
     # Tick lifecycle template
@@ -193,6 +235,11 @@ class DiscreteTimeAdapter(ABC):
         Subclasses implement _execute_tick() and _flush_pending_tool_results().
         """
         tick_start = asyncio.get_running_loop().time()
+        if self.realtime_pacing:
+            if self._next_tick_start is not None:
+                tick_start = self._next_tick_start
+            self._next_tick_start = tick_start + self.tick_duration_ms / 1000
+        self._current_tick_number = tick_number
 
         # 1. Flush pending tool results
         await self._flush_pending_tool_results()
@@ -213,9 +260,8 @@ class DiscreteTimeAdapter(ABC):
         )
 
         # 3. Prepend buffered audio from previous tick
-        for chunk_data, item_id in self._buffered_agent_audio:
-            result.agent_audio_chunks.append((chunk_data, item_id))
-        self._buffered_agent_audio.clear()
+        result.agent_audio_chunks = self._buffered_agent_audio
+        self._buffered_agent_audio = []
 
         # 4. Carry over skip state
         result.skip_item_id = self._skip_item_id
@@ -238,6 +284,11 @@ class DiscreteTimeAdapter(ABC):
 
         # 9. Update skip state for next tick
         self._skip_item_id = result.skip_item_id
+
+        # 9b. Drain usage records reported during this tick
+        if self._tick_usage_buffer:
+            result.usage_records.extend(self._tick_usage_buffer)
+            self._tick_usage_buffer.clear()
 
         # 10. Update cumulative user audio tracking
         self._cumulative_user_audio_ms += int(result.audio_sent_duration_ms)
@@ -326,7 +377,7 @@ class DiscreteTimeAdapter(ABC):
 # ---------------------------------------------------------------------------
 
 # Providers where the model is determined by the endpoint, not a parameter
-_PROVIDERS_WITH_ENDPOINT_DETERMINED_MODEL = ("xai",)
+_PROVIDERS_WITH_ENDPOINT_DETERMINED_MODEL: tuple[str, ...] = ("aai",)
 
 
 def create_adapter(
@@ -337,6 +388,12 @@ def create_adapter(
     reasoning_effort: Optional[str] = None,
     audio_format: Optional[AudioFormat] = None,
     cascaded_config: Any = None,
+    live_config: Optional["LiveConfig"] = None,
+    trace_path: Optional[Path] = None,
+    voice: Optional[str] = None,
+    transcription_language: Optional[str] = None,
+    language: Optional[str] = None,
+    avartha_config: Optional["AvarthaPipecatConfig"] = None,
 ) -> Tuple[DiscreteTimeAdapter, str]:
     """Create a discrete-time adapter for the given provider.
 
@@ -345,14 +402,19 @@ def create_adapter(
     and the resolved model name.
 
     Args:
-        provider: Provider identifier (openai, gemini, xai, nova, qwen,
-            livekit).
+        provider: Provider identifier (openai, gemini, xai, nova, qwen, aai,
+            avartha_pipecat, phonic, livekit).
         tick_duration_ms: Duration of each tick in milliseconds.
         send_audio_instant: If True, send audio in one call per tick.
         model: Model identifier. If None, uses the provider's default.
         audio_format: Audio format for external communication. Defaults to
             telephony (8kHz μ-law).
         cascaded_config: Configuration for cascaded providers (livekit).
+        live_config: Frontend and delegated backend configuration for OpenAI Live.
+        trace_path: Optional private protocol trace for OpenAI Live.
+        language: Resolved run language for supported provider hints. OpenAI
+            input transcription retains its explicit transcription_language setting.
+        avartha_config: Connection settings for a hosted Avartha agent.
 
     Returns:
         Tuple of (adapter, resolved_model).
@@ -360,6 +422,10 @@ def create_adapter(
     Raises:
         ValueError: If the provider is unknown.
     """
+    if voice is not None and provider != "openai":
+        raise ValueError(
+            "voice override currently requires openai; Live uses live_config.voice"
+        )
     # --- Resolve reasoning_effort default ---
     if reasoning_effort is None:
         reasoning_effort = DEFAULT_AUDIO_NATIVE_REASONING_EFFORT.get(provider)
@@ -367,7 +433,7 @@ def create_adapter(
     # --- Resolve model default ---
     if model is None:
         if provider == "livekit":
-            from tau2.voice.audio_native.livekit.config import CascadedConfig
+            from tau2.data_model.cascaded import CascadedConfig
 
             config = cascaded_config or CascadedConfig()
             model = config.llm.model
@@ -384,17 +450,47 @@ def create_adapter(
 
     # --- Construct adapter ---
     adapter: DiscreteTimeAdapter
-    if provider == "openai":
-        from tau2.voice.audio_native.openai.discrete_time_adapter import (
-            DiscreteTimeOpenAIAdapter,
+    if provider == "launa":
+        from tau2.voice.audio_native.launa.discrete_time_adapter import (
+            DiscreteTimeLaunaAdapter,
         )
 
-        adapter = DiscreteTimeOpenAIAdapter(
+        adapter = DiscreteTimeLaunaAdapter(
             tick_duration_ms=tick_duration_ms,
             send_audio_instant=send_audio_instant,
             model=model,
             reasoning_effort=reasoning_effort,
             audio_format=audio_format,
+        )
+    elif provider == "openai":
+        from tau2.voice.audio_native.openai.discrete_time_adapter import (
+            DiscreteTimeOpenAIAdapter,
+        )
+
+        adapter = DiscreteTimeOpenAIAdapter(
+            voice=voice,
+            transcription_language=transcription_language,
+            tick_duration_ms=tick_duration_ms,
+            send_audio_instant=send_audio_instant,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            audio_format=audio_format,
+        )
+    elif provider == "openai_live":
+        from tau2.voice.audio_native.openai.live_adapter import (
+            DiscreteTimeOpenAILiveAdapter,
+        )
+
+        if live_config is None:
+            raise ValueError("openai_live requires live_config with a backend model")
+        adapter = DiscreteTimeOpenAILiveAdapter(
+            tick_duration_ms=tick_duration_ms,
+            model=model,
+            config=live_config,
+            reasoning_effort=reasoning_effort,
+            send_audio_instant=send_audio_instant,
+            audio_format=audio_format,
+            trace_path=trace_path,
         )
     elif provider == "gemini":
         from tau2.voice.audio_native.gemini.discrete_time_adapter import (
@@ -402,6 +498,7 @@ def create_adapter(
         )
 
         adapter = DiscreteTimeGeminiAdapter(
+            language=language,
             tick_duration_ms=tick_duration_ms,
             send_audio_instant=send_audio_instant,
             model=model,
@@ -413,8 +510,10 @@ def create_adapter(
         )
 
         adapter = DiscreteTimeXAIAdapter(
+            language=language,
             tick_duration_ms=tick_duration_ms,
             send_audio_instant=send_audio_instant,
+            model=model,
             reasoning_effort=reasoning_effort,
         )
     elif provider == "nova":
@@ -439,8 +538,42 @@ def create_adapter(
             model=model,
             reasoning_effort=reasoning_effort,
         )
+    elif provider == "aai":
+        from tau2.voice.audio_native.aai.discrete_time_adapter import (
+            DiscreteTimeAAIAdapter,
+        )
+
+        adapter = DiscreteTimeAAIAdapter(
+            tick_duration_ms=tick_duration_ms,
+            send_audio_instant=send_audio_instant,
+            reasoning_effort=reasoning_effort,
+        )
+    elif provider == "avartha_pipecat":
+        from tau2.voice.audio_native.avartha_pipecat.discrete_time_adapter import (
+            DiscreteTimeAvarthaPipecatAdapter,
+        )
+
+        adapter = DiscreteTimeAvarthaPipecatAdapter(
+            tick_duration_ms=tick_duration_ms,
+            send_audio_instant=send_audio_instant,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            audio_format=audio_format,
+            avartha_config=avartha_config,
+        )
+    elif provider == "phonic":
+        from tau2.voice.audio_native.phonic.discrete_time_adapter import (
+            DiscreteTimePhonicAdapter,
+        )
+
+        adapter = DiscreteTimePhonicAdapter(
+            tick_duration_ms=tick_duration_ms,
+            send_audio_instant=send_audio_instant,
+            model=model,
+            reasoning_effort=reasoning_effort,
+        )
     elif provider == "livekit":
-        from tau2.voice.audio_native.livekit.config import CascadedConfig
+        from tau2.data_model.cascaded import CascadedConfig
         from tau2.voice.audio_native.livekit.discrete_time_adapter import (
             LiveKitCascadedAdapter,
         )

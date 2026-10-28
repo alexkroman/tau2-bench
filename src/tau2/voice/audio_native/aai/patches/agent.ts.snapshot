@@ -1,0 +1,466 @@
+import { readFileSync } from "node:fs";
+import { parseEnv } from "node:util";
+import { agent, assemblyAIS2s } from "@alexkroman1/aai";
+import { assemblyAILlm, cerebrasLlm, openRouterLlm } from "@alexkroman1/aai/llm";
+import { assemblyAIStt } from "@alexkroman1/aai/stt";
+import { assemblyAITts } from "@alexkroman1/aai/tts";
+
+/**
+ * Read one value straight out of the project's `.env`.
+ *
+ * Needed because of an ordering quirk: the dev server calls `loadAgentDef()`
+ * — this module — BEFORE `resolveServerEnv()`, and that function deliberately
+ * never copies `.env` into `process.env`. So at the moment this module runs, a
+ * `.env`-only value is invisible to `process.env`. Everything else in the
+ * agent reads its secrets later, through `ctx.env`, and never hits this.
+ *
+ * `.env` resolves against cwd, which is the project directory: the dev server
+ * evaluates the bundle from a tmpdir, but does not change cwd. Fail-soft — a
+ * missing or unreadable `.env` just means "not set here".
+ */
+function fromDotEnv(name: string): string | undefined {
+  try {
+    return (parseEnv(readFileSync(".env", "utf8")) as Record<string, string>)[name] || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// Base agent for tau2-bench host-mode runs. The harness connects with ?host=1
+// and injects its own system prompt + the domain's tool schemas, so only the
+// provider config is inherited — which is what makes this file the right place
+// to A/B a transport or an STT endpoint: it is the one thing the benchmark
+// does NOT override.
+//
+// AAI_S2S selects the SESSION MODE. Unset runs the cascaded pipeline (STT ->
+// LLM -> TTS as host-side stages); set runs AssemblyAI's Voice Agent API, where
+// all three happen service-side over one socket. Both modes ship from this one
+// file so the arms cannot drift the way two directories would.
+//
+// Note what does NOT carry across the switch: min/max_turn_silence, holdPhrase
+// and the dead-air cover are pipeline-only, since S2S owns endpointing and
+// turn-taking end to end. An S2S run is a separate baseline, not an A/B against
+// a pipeline run. tau2's NL assertions also under-score it — the service emits
+// no `transcript.agent` on tool-call turns, so the turns that do the work read
+// as blank agent text. DB reward is unaffected.
+//
+// S2S ALSO PINS THE AUDIO RATE, and the harness has to match. The Voice Agent
+// API accepts 24 kHz alone in each direction and honours no declaration to the
+// contrary, so 16 kHz audio is decoded at 24 kHz — 1.5x fast — and the service
+// then emits NOTHING: no speech edge, no transcript, no error. The agent greets
+// and is deaf for the rest of the call. That is what the 2/25 retail S2S run
+// was (62 of 171 user turns answered, an unresponsive period in 25 of 25
+// sessions, against 15/25 and 18/25 for the pipeline arms on the same tasks),
+// and it survived a first fix that pinned the rate everywhere EXCEPT in the
+// bytes: tau2 derives its send rate from `DEFAULT_AAI_INPUT_SAMPLE_RATE` and
+// treats our config frame as a bare handshake ack, so every number said 24 kHz
+// while every sample was still 16 kHz.
+//
+// So tau2 now declares NO rate and adopts the pair this host announces in
+// `session.configured` (24/24 under S2S, the SDK's 16/24 on the pipeline), and
+// the SDK REJECTS a config frame declaring a rate it cannot honour
+// (`assertHostRatesSupported`) should anything declare one again. Either way
+// the failure is loud, at connect, rather than a call that hears nothing.
+const useS2s = /^(1|true|yes|on)$/i.test(process.env.AAI_S2S ?? "");
+
+// Sandbox endpoints, selectable PER STAGE — STT and TTS only. AAI_STAGING sets
+// the default for both; AAI_STAGING_STT / _TTS override it individually, so
+//
+//   AAI_STAGING=1 AAI_STAGING_TTS=0
+//
+// runs STT on the sandbox with TTS on production — which is the configuration
+// that works today, because the sandbox TTS service answers 503 (its router is
+// live: a wrong path on that host 404s, so the route exists and the backend
+// behind it does not).
+//
+// THE LLM IS NEVER STAGED, and is never declared in this file at all: an unset
+// stage is filled from the SDK default (gpt-5.5 with `reasoningEffort: "none"`),
+// while declaring a stage REPLACES the descriptor whole — so any pinned copy,
+// including one written only to carry a sandbox gateway URL, silently stops
+// tracking that default the day it changes. Holding the model identical across
+// arms is also the better control for an STT A/B: it removes the model as a
+// variable. AAI_STAGING_LLM is no longer read; setting it does nothing.
+//
+// AAI_STT_URL still takes an arbitrary URL and WINS over all of it, matching how
+// the SDK resolves `streamingUrl` over `region` — naming an endpoint is
+// deliberate and a convenience flag must not silently overwrite it. STT URLs
+// must carry the versioned `/v3/ws` path; the SDK supplies that only for its own
+// default host, so a bare origin connects to the wrong route. All of this is
+// ignored under AAI_S2S, which opens none of these sockets.
+const STAGING_STT_URL = "wss://streaming.sandbox000.assemblyai-labs.com/v3/ws";
+const STAGING_TTS_HOST = "streaming-tts.sandbox000.assemblyai-labs.com";
+
+/** Parse a boolean env var, falling back to `dflt` when unset or empty. */
+function envFlag(value: string | undefined, dflt: boolean): boolean {
+  if (value === undefined || value === "") return dflt;
+  return /^(1|true|yes|on)$/i.test(value);
+}
+
+const stagingAll = envFlag(process.env.AAI_STAGING, false);
+const stagingStt = envFlag(process.env.AAI_STAGING_STT, stagingAll);
+const stagingTts = envFlag(process.env.AAI_STAGING_TTS, stagingAll);
+const anyStaging = stagingStt || stagingTts;
+
+const streamingUrl = process.env.AAI_STT_URL ?? (stagingStt ? STAGING_STT_URL : undefined);
+
+// AssemblyAI keys are STRICTLY environment-scoped, measured against both
+// clusters: a production key is rejected by sandbox STT (1008) and a staging key
+// is rejected by production STT and production TTS (also 1008). So a mixed run
+// needs BOTH keys live at once, and the stage on the sandbox has to name its own
+// credential — hence `apiKeyEnv` below rather than swapping ASSEMBLYAI_API_KEY
+// globally, which is what made sandbox-STT-plus-production-TTS fail with
+// "AssemblyAI TTS (1008): Unauthorized: Invalid API key".
+//
+// Both variables are read from the agent env like any other credential, so both
+// belong in .env. Fail fast if the staging one is missing: the alternative is a
+// 1008 several records into a run, which reads as a sandbox outage.
+const STAGING_KEY_ENV = "ASSEMBLYAI_STAGING_API_KEY";
+if (anyStaging && !(process.env[STAGING_KEY_ENV] ?? fromDotEnv(STAGING_KEY_ENV))) {
+  throw new Error(
+    `Staging mode needs ${STAGING_KEY_ENV} — add it to .env or export it. ` +
+      "The sandbox cluster and production issue different keys, and a mixed run needs both.",
+  );
+}
+
+/** `apiKeyEnv` for a stage, omitted entirely when that stage is on production. */
+const keyEnv = (staging: boolean) => (staging ? { apiKeyEnv: STAGING_KEY_ENV } : {});
+
+const name = "tau2-pipeline";
+
+// AAI_PREEMPT decides preemptive generation for an A/B; unset leaves the SDK
+// default alone. The feature shipped ON and unmeasured, and the first
+// measurement (run 563's server log) is ambiguous: 14 adoptions bought a p50
+// 0.44s head start, but 5 of them (36%) were POISONED after adoption by a tool
+// call and restarted the turn from scratch, each having burned p50 0.69s
+// first. Net +8ms per caller turn — nothing, against a p50 first word of ~1.0s
+// — while 44% of the LLM requests it issued were thrown away.
+//
+// The flag is threaded here rather than by flipping the default because the
+// A/B has to differ in ONE thing, and rebuilding the SDK between arms would
+// also pick up whatever else is in the tree.
+// AAI_LLM_MODEL selects the pipeline LLM for a model A/B; unset keeps the SDK
+// default (`gpt-5.6-terra`, which the factory FORCES to
+// `reasoningEffort: "none"` because that family rejects tool calls with any
+// other setting). Declaring a stage replaces the descriptor whole, so naming a
+// model here also drops the pipeline preset's `"none"` pin — which is the
+// point: a model outside `TOOLS_REQUIRE_NO_REASONING` can actually reason, and
+// whether that helps multi-step tool tasks is the hypothesis.
+//
+// Worth knowing before reading a result: `packages/aai/CLAUDE.md` records that
+// NO default here has ever been chosen on answer quality, and terra has
+// neither paired latency numbers nor a quality run. Measured time-to-first-
+// token at the same settings: gpt-5.6-luna 832ms, gpt-5.5 999ms,
+// claude-opus-4-8 1217ms, claude-sonnet-5 1568ms.
+const llmModel = process.env.AAI_LLM_MODEL?.trim();
+
+// AAI_LLM_GATEWAY_URL redirects the LLM stage's base URL. This exists for ONE
+// job: confirming what is actually in the assembled system prompt at run time.
+// Point it at gate-prompt-recorder.mjs and the real pipeline POSTs the real
+// prompt to a local sink, which is the only way to see the bytes — the SDK logs
+// no prompt, and `buildHostAgent` deciding whether `voicePresets` survives the
+// host override is exactly the kind of thing that must not be settled by
+// reading the source. A probe run is not a graded run: the recorder returns a
+// canned completion, so the agent cannot do the task.
+const llmGatewayUrl = process.env.AAI_LLM_GATEWAY_URL?.trim();
+const llmOpts = {
+  ...(llmModel ? { model: llmModel } : {}),
+  ...(llmGatewayUrl ? { gatewayUrl: llmGatewayUrl } : {}),
+};
+
+// AAI_LLM_PROVIDER picks the FACTORY, because a model id alone cannot: the
+// AssemblyAI gateway names a bare model (`gpt-5.6-luna`) and OpenRouter names
+// `creator/model` (`z-ai/glm-5.3-flash`), so handing the latter to
+// `assemblyAILlm` POSTs a valid-looking request to the wrong gateway and gets
+// back a model-not-found that reads like the model being unavailable. Naming
+// the provider makes the arm state its own configuration, which is the same
+// reason AAI_S2S and AAI_MIN_TURN_SILENCE are env flags rather than edits.
+//
+// `openrouter` resolves its key host-side from OPENROUTER_API_KEY in this
+// project's .env — the descriptor carries no secret.
+const LLM_PROVIDERS = ["assemblyai", "openrouter", "cerebras"] as const;
+const llmProvider = (process.env.AAI_LLM_PROVIDER?.trim() || "assemblyai").toLowerCase();
+if (!LLM_PROVIDERS.includes(llmProvider as (typeof LLM_PROVIDERS)[number])) {
+  throw new Error(
+    `AAI_LLM_PROVIDER must be one of ${LLM_PROVIDERS.join("|")}, got ${JSON.stringify(llmProvider)}`,
+  );
+}
+// A gateway URL is an AssemblyAI-stage concept (the prompt recorder); passing
+// it on the OpenRouter arm would be silently ignored, so it is refused loudly.
+if (llmProvider !== "assemblyai" && llmGatewayUrl) {
+  throw new Error(`AAI_LLM_GATEWAY_URL is not honoured on the ${llmProvider} arm`);
+}
+// OpenRouter's `model` is REQUIRED where AssemblyAI's is optional (that stage
+// has a default), which `tsc` catches if the two factories are unioned behind
+// one variable. So the descriptor is built per branch, and the openrouter arm
+// refuses to start without an id rather than resolving to some default the
+// run's name would not record.
+const llmDescriptor = ((): ReturnType<typeof assemblyAILlm> | undefined => {
+  if (llmProvider === "openrouter") {
+    if (!llmModel) throw new Error("AAI_LLM_PROVIDER=openrouter requires AAI_LLM_MODEL");
+    return openRouterLlm({ model: llmModel });
+  }
+  if (llmProvider === "cerebras") {
+    if (!llmModel) throw new Error("AAI_LLM_PROVIDER=cerebras requires AAI_LLM_MODEL");
+    return cerebrasLlm({ model: llmModel });
+  }
+  return Object.keys(llmOpts).length > 0 ? assemblyAILlm(llmOpts) : undefined;
+})();
+
+// AAI_FORCE_EOT is the confidence-triggered endpointing arm: unset leaves the
+// SDK default (0, service decides), a number sets the threshold. 0.75 is the
+// value the live traces support — the identifier ramp clears it twice before
+// the service revises the text, the hesitant ramp peaks at 0.62 and never does.
+// See `assemblyAIStt({ forceEndpointConfidence })` for both traces.
+//
+// Threaded as an env arm rather than a changed default for the usual reason:
+// the two arms have to differ in ONE thing, and the failure mode here is a
+// truncated identifier, which only reward prices.
+const forceEot = process.env.AAI_FORCE_EOT?.trim();
+const forceEndpoint =
+  forceEot === undefined || forceEot === ""
+    ? {}
+    : { forceEndpointConfidence: Number.parseFloat(forceEot) };
+
+// AAI_MIN_TURN_SILENCE is the endpointing-budget arm, in milliseconds: unset
+// leaves DEFAULT_MIN_TURN_SILENCE_MS (1600), a number overrides it. 1600 is
+// the measured value for this corpus — 400 truncates 90% of utterances — but
+// the budget is also pure added latency on every turn the caller has already
+// finished, and this corpus's failures are abandonment loops rather than
+// truncations. So the direction worth testing is DOWN from 1600, not up.
+//
+// An env arm rather than a changed default for the AAI_FORCE_EOT reason: the
+// two arms have to differ in one thing, and unset must be byte-identical to
+// every run before the knob existed.
+const minSilence = process.env.AAI_MIN_TURN_SILENCE?.trim();
+const minTurnSilence =
+  minSilence === undefined || minSilence === ""
+    ? {}
+    : { minTurnSilenceMs: Number.parseInt(minSilence, 10) };
+
+// AAI_MAX_TURN_SILENCE is the FORCE-END ceiling, in milliseconds: unset leaves
+// the resolved default (3500), a number overrides it. It exists because the
+// comment above was wrong about where the latency lives.
+//
+// Replayed over 29 retail sims / 384 caller utterances (see tau2-bench
+// `RESULTS-endpointing-sweep.md`), lowering `min` moves the MEDIAN wait and
+// nothing else: 1600 -> 300 took p50 from 2200ms to 850ms and left p90 at
+// 4000ms, within noise of where it started. 3500 -> 2560 took p90 to 3300ms —
+// the only arm that moved the tail at all — for 1.1pp more split turns against
+// 3.7pp for one step of `min`. An agent reads as unresponsive on its worst
+// turns, not its median one, so this is the cheaper knob and it was not
+// reachable from the descriptor.
+//
+// Combined, 1000/2560 measured p50 1600ms and p90 3100ms for +4.7pp splits,
+// with word recall flat — the two compose, and the tail slightly better than
+// additively.
+//
+// An env arm rather than a changed default for the AAI_MIN_TURN_SILENCE
+// reason: unset must stay byte-identical to every run before the knob existed.
+// `config-rules.ts` rejects an inverted pair, so a max below the effective min
+// fails the build rather than shipping.
+const maxSilence = process.env.AAI_MAX_TURN_SILENCE?.trim();
+const maxTurnSilence =
+  maxSilence === undefined || maxSilence === ""
+    ? {}
+    : { maxTurnSilenceMs: Number.parseInt(maxSilence, 10) };
+
+// AAI_STT_MODEL is the speech-model arm: unset leaves
+// ASSEMBLYAI_STT_DEFAULT_MODEL (`universal-3-5-pro`), a name overrides it.
+// `universal-3-6-pro` is the reason it exists, and it is served by BOTH the
+// production endpoint and sandbox000 — confirmed against each cluster with
+// real caller audio, not inferred from a model list, because the `Begin` frame
+// echoes the model the service actually resolved and a name it does not know
+// would come back as something else.
+//
+// So the model and the CLUSTER are two arms, not one: dialling
+// AAI_STAGING_STT=1 to get 3.6-pro would move both at once against a baseline
+// that ran production, and a reward delta could not be attributed to either.
+//
+// One behaviour change rides along with any name outside the 3.5-pro family:
+// `isUniversal35Pro` gates `format_turns` (accepted everywhere EXCEPT that
+// family) — inert here, since this agent never sets `formatTurns`, but it is
+// the thing to check first if a 3.6-pro arm's transcripts come back unformatted.
+const sttModelName = process.env.AAI_STT_MODEL?.trim();
+const sttModel = sttModelName ? { model: sttModelName } : {};
+
+// AAI_VOICE_FOCUS is the voice-isolation arm. Unset keeps the SDK default
+// (`near-field`, with no threshold sent alongside it — see the next block);
+// `off` sends NOTHING, which is what the service itself defaults to — a
+// `Begin` frame from a connection that omits the parameter echoes
+// `"voice_focus": null`.
+//
+// The arm has to exist because OMITTING the option does not omit the
+// parameter. `resolveAssemblyAISttSettings` fills `options.voiceFocus ??
+// DEFAULT_VOICE_FOCUS` and `buildTranscriberParams` sends it whenever it is
+// truthy, so every run on this harness — including every A/B in
+// RESULTS-u35-prod-vs-u36-sandbox.md and the 2026-09-14 baseline — has had
+// near-field isolation on, and none of them measured what it buys. Only the
+// literal "off" normalises to "" and falls out of the request. The MODE still
+// works this way; the STRENGTH no longer does.
+//
+// NOT everything can be handed back to the service this way: `min_turn_silence`
+// and `max_turn_silence` are set unconditionally from resolved settings
+// (1600/3500), with no descriptor value that omits them, while the service
+// takes its minimum from the `mode` preset and its maximum as 1536. A "service
+// defaults" run is therefore defaults-except-endpointing until the SDK makes
+// those optional. It is identical across arms, so it does not confound a
+// comparison — it just means this is not a bare baseline.
+// AAI_VOICE_FOCUS_THRESHOLD is the suppression-strength arm. Unset leaves the
+// SDK default, DEFAULT_VOICE_FOCUS_THRESHOLD (0.9), which the SDK sends on
+// both transports whenever voice focus is on; a number overrides it.
+//
+// A 2026-09-21 working-tree change dropped that default so the service picked
+// (0.7 on Streaming v3, 0.85 on S2S). It was never committed and 0.9 is the
+// default again, so unset matches every run on this harness except the
+// voice-isolator experiment, which pinned 0.7 explicitly. To reproduce the
+// service's own strength, set AAI_VOICE_FOCUS_THRESHOLD=0.7.
+const voiceFocusThresholdRaw = process.env.AAI_VOICE_FOCUS_THRESHOLD?.trim();
+const voiceFocusThresholdOpt =
+  voiceFocusThresholdRaw === undefined || voiceFocusThresholdRaw === ""
+    ? {}
+    : { voiceFocusThreshold: Number.parseFloat(voiceFocusThresholdRaw) };
+
+const voiceFocusMode = process.env.AAI_VOICE_FOCUS?.trim();
+const voiceFocusOpt = voiceFocusMode ? { voiceFocus: voiceFocusMode } : {};
+
+const preempt = process.env.AAI_PREEMPT;
+const preemptiveGeneration = preempt === undefined || preempt === "" ? {} : { preemptiveGeneration: /^(1|true|yes|on)$/i.test(preempt) };
+
+// AAI_VOICE_PRESETS selects the opt-in prompt presets (`voicePresets`), comma
+// separated: e.g. AAI_VOICE_PRESETS=smartMatching. An env flag rather than a
+// literal for the same reason AAI_S2S is one — the arm has to be switchable
+// without editing this file, so a gate run can state its own configuration and
+// the unset case is byte-identical to every run before the field existed.
+//
+// These land in the system prompt in HOST MODE too, which is not obvious and is
+// the whole reason an arm using them is measurable here: tau2 sends only
+// `systemPrompt`, `tools` and `greeting`, and `buildHostAgent` overrides
+// exactly those three (plus maxSteps/sttPrompt) while spreading the rest of the
+// base agent through — so `voicePresets` is inherited like the provider triple.
+// Confirmed at run time, not inferred: see gate-confirm-preset.mjs.
+// AAI_BUILTINS enables host-executed builtins, comma separated: e.g.
+// AAI_BUILTINS=verify_action. Unset is byte-identical to every run before the
+// flag existed (`DEFAULT_BUILTIN_TOOLS` is empty).
+//
+// These reach the model IN HOST MODE, which is not obvious and is what makes
+// the arm measurable here. tau2 injects its own `tools`, and `buildHostAgent`
+// sets `tools: {}` — so a custom tool in this project is DROPPED — but it
+// spreads the base agent, so `builtinTools` survives, and `setupSandboxTools`
+// merges those schemas into the advertised list and executes them HOST-SIDE
+// rather than relaying them. The harness never learns the tool exists.
+//
+// Two things to know before reading a result:
+//
+// `calculate` is NOT worth enabling: tau2's retail domain supplies its own
+// `calculate` (it is in the gold action list, and this agent called it in 11
+// of 108 sims), and `mergeBuiltinSurface` drops a builtin a provided tool
+// shadows. It would be inert, and logged as inert.
+//
+// `verify_action` is the arm with a measured target and a measured COST.
+// Of the 58 failures in `full-retail-fixed`, 13 are a write reaching the right
+// tool with wrong arguments — 3 of them setting a field to the value it
+// already held — which is what that tool's before/after schema is for. The
+// cost is that it is one more tool call in the gap before the agent speaks,
+// and on that same run a reply's chance of being CANCELLED before the caller
+// heard any of it scaled with exactly that: 15% with no tool call in the gap,
+// 41% at 1-2, 60% at 3-5, 75% at 6+. So it buys at most 13 failures and pays
+// on all 108, and the honest expectation is that it cannot be read until the
+// delivery loss is fixed.
+const builtinList = (process.env.AAI_BUILTINS ?? "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter((s) => s !== "");
+const builtinTools = builtinList.length === 0 ? {} : { builtinTools: builtinList as never };
+
+const presetList = (process.env.AAI_VOICE_PRESETS ?? "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter((s) => s !== "");
+const voicePresets = presetList.length === 0 ? {} : { voicePresets: presetList as never };
+
+// AAI_STT_LANGUAGES pins the recognizer's languages, comma separated: e.g.
+// AAI_STT_LANGUAGES=en. Unset leaves the SDK default (no pin). Every run before
+// 2026-09-22 pinned `["en"]` unconditionally, so reproducing one of them needs
+// AAI_STT_LANGUAGES=en — see the note at the `stt` stage below for why.
+const languageList = (process.env.AAI_STT_LANGUAGES ?? "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter((s) => s !== "");
+const sttLanguages = languageList.length === 0 ? {} : { languages: languageList as never };
+
+// Every STT arm, merged. Empty when no arm is set, which is what keeps the
+// stage undeclared and the SDK's own descriptor in place.
+const sttOptions = {
+  ...sttLanguages,
+  ...sttModel,
+  ...voiceFocusOpt,
+  ...voiceFocusThresholdOpt,
+  ...forceEndpoint,
+  ...minTurnSilence,
+  ...maxTurnSilence,
+  ...(streamingUrl ? { streamingUrl } : {}),
+  ...keyEnv(stagingStt),
+};
+
+const pipeline = {
+        name,
+        ...builtinTools,
+        ...preemptiveGeneration,
+        ...voicePresets,
+        ...(llmDescriptor ? { llm: llmDescriptor } : {}),
+        // sttPrompt: transcription biasing. The comment that used to sit here
+        // said the harness sends its own via the host config block — that is
+        // FALSE. tau2's `_build_config_message` sends `systemPrompt`, `tools`
+        // and `greeting` and nothing else, so this line ran unbiased for every
+        // run before 2026-08-07, against a measured 71-75% mis-hearing rate
+        // with up to 32% of mis-hearings reaching a tool call as a wrong
+        // argument.
+        //
+        // MEASURED AND REVERTED (run 577, 3 trials x 10 tasks). A domain-free
+        // prompt naming how callers render values aloud (spelled letters,
+        // digit-by-digit numbers) did NOT reduce mis-hearing: 73% -> 72%,
+        // inside noise, while mis-hearings reaching a tool call went 13% ->
+        // 32% and reward 0.433 -> 0.267. The S2S precedent (1 of 6 first names
+        // correct -> 6 of 6) came bundled with language pinning and a voice
+        // focus change, so it never isolated the prompt; this run does, and
+        // the prompt alone is not the lever. A domain-SPECIFIC vocabulary
+        // (actual catalogue terms) is the untested variant, and is exactly the
+        // benchmark-specific knowledge this agent must not encode.
+        // languages: ["en"] pins the line to English. Universal-3.5 Pro
+        // code-switches across 18 languages when this is unset, and tau2's retail
+        // domain is English-only — measured, the unpinned model returned English
+        // utterances transliterated into Devanagari and Hebrew script, including
+        // authentication turns, which reads as a mis-hearing rather than a
+        // language selection.
+        //
+        // NO LONGER SET (2026-09-22): this agent overrides no SDK default, so
+        // the language is the SDK's too (unset, code-switching). Pinning it is
+        // now an explicit arm rather than a baked-in deviation.
+        //
+        // Stages are declared ONLY when an arm names something. Declaring a
+        // stage replaces its default descriptor whole — the LLM rule from the
+        // staging block — so even `assemblyAIStt({})` or `assemblyAITts()` is
+        // an override in waiting. With every arm unset, all three stages come
+        // from the SDK's own default fill, the same as a bare `agent()`.
+      };
+
+const sttStage = Object.keys(sttOptions).length > 0 ? assemblyAIStt(sttOptions) : undefined;
+const ttsStage = stagingTts
+  ? assemblyAITts({ host: STAGING_TTS_HOST, ...keyEnv(true) })
+  : undefined;
+
+// One literal per stage combination rather than conditional spreads: the agent
+// params type is a union keyed on whether `stt` (and separately `tts`) is
+// present, and under `exactOptionalPropertyTypes` a spread's `stt?: SttProvider
+// | undefined` fits neither member.
+export default agent(
+  useS2s
+    ? { name, ...builtinTools, s2s: assemblyAIS2s() }
+    : sttStage && ttsStage
+      ? { ...pipeline, stt: sttStage, tts: ttsStage }
+      : sttStage
+        ? { ...pipeline, stt: sttStage }
+        : ttsStage
+          ? { ...pipeline, tts: ttsStage }
+          : pipeline,
+);

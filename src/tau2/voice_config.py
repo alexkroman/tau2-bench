@@ -1,6 +1,7 @@
 # Copyright Sierra
 """Voice configuration constants."""
 
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -30,7 +31,19 @@ def resolve_burst_noise_paths(filenames: list[str]) -> list[Path]:
 
 
 # Voice Synthesis & Transcription
-DEFAULT_VOICE_SYNTHESIS_PROVIDER = "elevenlabs"
+#
+# The caller's voice. Env-overridable because the audio-native path exposes no
+# CLI flag for it, and because the choice is operational rather than per-run:
+# ElevenLabs is metered against a credit balance, and it drained mid-run once —
+# `'code': 'quota_exceeded'`, 0 credits left — turning 54 of 114 sims into
+# `infrastructure_error`. `TAU2_TTS_PROVIDER=assemblyai` switches the caller to
+# AssemblyAI streaming TTS, which bills the same key the agent already uses.
+#
+# **The two are not acoustically interchangeable**, so a run is comparable only
+# to runs using the same one — ElevenLabs v3 renders `[cough]`/`[pause]` as
+# audio and AssemblyAI has no tag vocabulary, so those markers are stripped.
+# See `SYNTHESIS_PROVIDERS` in `voice/synthesis/synthesize.py`.
+DEFAULT_VOICE_SYNTHESIS_PROVIDER = os.getenv("TAU2_TTS_PROVIDER", "elevenlabs")
 DEFAULT_TRANSCRIPTION_MODEL = "nova-3"
 ASSUMED_TURNS_PER_MINUTE = 10
 ELEVENLABS_ENABLE_AUDIO_TAGS = True
@@ -121,6 +134,3 @@ OUT_OF_TURN_SPEECH_EVENTS_PER_MINUTE = 0.7
 ENABLE_VOCAL_TICS_DURING_SPEECH = True
 VOCAL_TICS_DURING_SPEECH_PROBABILITY = 0.1
 MIN_WORDS_FOR_VOCAL_TICS = 3
-
-# Backchannel
-BACKCHANNEL_PHRASES = ["uh-huh", "mm-hmm"]
