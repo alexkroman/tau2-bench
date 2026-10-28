@@ -155,9 +155,8 @@ class TestAAIVoiceAgentProvider:
         assert tool["description"] == "Test function"
         assert "function" not in tool
 
-    def test_format_tools_for_api_sends_read_write_annotations(self) -> None:
-        """READ/WRITE tools carry readOnlyHint for the host's write gate;
-        others carry no annotation."""
+    def test_format_tools_for_api_sends_read_write_effect(self) -> None:
+        """READ/WRITE tools carry the host's ``effect``; others carry none."""
         from tau2.domains.retail.environment import get_environment
 
         tools = {t.name: t for t in get_environment().get_tools()}
@@ -171,11 +170,10 @@ class TestAAIVoiceAgentProvider:
                 ]
             )
         }
-        assert formatted["get_order_details"]["annotations"] == {"readOnlyHint": True}
-        assert formatted["return_delivered_order_items"]["annotations"] == {
-            "readOnlyHint": False
-        }
-        assert "annotations" not in formatted["calculate"]
+        assert formatted["get_order_details"]["effect"] == "read"
+        assert formatted["return_delivered_order_items"]["effect"] == "write"
+        assert "effect" not in formatted["calculate"]
+        assert all("annotations" not in t for t in formatted.values())
 
     def test_with_host_flag_appends_query_param(self) -> None:
         """Test _with_host_flag appends ?host=1 to URL."""

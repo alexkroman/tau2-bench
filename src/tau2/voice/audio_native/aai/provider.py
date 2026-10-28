@@ -202,27 +202,28 @@ class AAIVoiceAgentProvider:
                 "description": func_schema["description"],
                 "parameters": func_schema["parameters"],
             }
-            annotations = self._tool_annotations(tool)
-            if annotations:
-                formatted["annotations"] = annotations
+            effect = self._tool_effect(tool)
+            if effect:
+                formatted["effect"] = effect
             formatted_tools.append(formatted)
         return formatted_tools
 
     @staticmethod
-    def _tool_annotations(tool) -> Dict:
-        """MCP-style hints from the tool's declared type, never sent to the model.
+    def _tool_effect(tool) -> Optional[str]:
+        """The AAI ``ToolSchema.effect`` for the tool's declared type, never sent to the model.
 
-        READ -> ``readOnlyHint: true``, WRITE -> ``readOnlyHint: false``; other
-        types (THINK, GENERIC) send nothing. The host uses ``false`` to run a
-        write only on a caller turn that did not start over the agent's audio,
-        so an "uh-huh" spoken over its question cannot confirm the action.
+        READ -> ``"read"``, WRITE -> ``"write"``; other types (THINK, GENERIC)
+        send nothing. A declared write runs only on a caller turn that did not
+        start over the agent's audio (an "uh-huh" spoken over its question cannot
+        confirm the action), turns on the host's ledger of lookups, and has its
+        identifier arguments checked against earlier results.
         """
         tool_type = getattr(getattr(tool, "_func", None), TOOL_TYPE_ATTR, None)
         if tool_type == ToolType.READ:
-            return {"readOnlyHint": True}
+            return "read"
         if tool_type == ToolType.WRITE:
-            return {"readOnlyHint": False}
-        return {}
+            return "write"
+        return None
 
     def _build_config_message(self, system_prompt: str, tools: tuple) -> Dict:
         """Build the configuration message for the AAI host.
